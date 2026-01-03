@@ -1,0 +1,66 @@
+services:
+  # Redis for memory system
+  redis:
+    image: redis:7-alpine
+    container_name: xorng-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - xorng-network
+
+  # XORNG Core orchestrator
+  xorng-core:
+    build:
+      context: ../core
+      dockerfile: Dockerfile
+    container_name: xorng-core
+    ports:
+      - "3000:3000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=info
+      - NODE_ENV=production
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - xorng-network
+
+  # Code Review Validator
+  validator-code-review:
+    build:
+      context: ../validator-code-review
+      dockerfile: Dockerfile
+    container_name: xorng-validator-code-review
+    environment:
+      - LOG_LEVEL=info
+    networks:
+      - xorng-network
+
+  # Security Validator
+  validator-security:
+    build:
+      context: ../validator-security
+      dockerfile: Dockerfile
+    container_name: xorng-validator-security
+    environment:
+      - LOG_LEVEL=info
+    networks:
+      - xorng-network
+
+volumes:
+  redis-data:
+
+networks:
+  xorng-network:
+    driver: bridge
