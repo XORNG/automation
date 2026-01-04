@@ -1,5 +1,30 @@
 services:
   # ===========================================
+  # Docker Socket Proxy (handles API version negotiation)
+  # Required because Traefik's internal Docker client doesn't respect
+  # DOCKER_API_VERSION env var and uses hardcoded 1.24
+  # ===========================================
+  dockerproxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: dockerproxy
+    restart: unless-stopped
+    profiles:
+      - with-domain
+    privileged: true
+    environment:
+      # Grant read access to containers, networks, services for Traefik
+      - CONTAINERS=1
+      - NETWORKS=1
+      - SERVICES=1
+      - TASKS=1
+      - INFO=1
+      - VERSION=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - xorng-network
+
+  # ===========================================
   # Traefik Reverse Proxy (automatic HTTPS)
   # Only used when AUTOMATION_DOMAIN is set
   # ===========================================
@@ -9,15 +34,15 @@ services:
     restart: unless-stopped
     profiles:
       - with-domain  # Only starts when profile is active
-    environment:
-      # Force Docker API version compatibility with host
-      - DOCKER_API_VERSION=1.44
+    depends_on:
+      - dockerproxy
     command:
       # API and Dashboard (for debugging)
       - "--api.insecure=true"
-      - "--log.level=DEBUG"
-      # Docker provider
+      - "--log.level=INFO"
+      # Docker provider - connect via socket proxy instead of direct socket
       - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://dockerproxy:2375"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=xorng-network"
       # Entry points
@@ -36,7 +61,6 @@ services:
       - "8080:8080"  # Traefik dashboard for debugging
     volumes:
       - letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - xorng-network
 
