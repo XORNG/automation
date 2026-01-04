@@ -10,21 +10,27 @@ services:
     profiles:
       - with-domain  # Only starts when profile is active
     command:
+      # API and Dashboard (for debugging)
+      - "--api.insecure=true"
+      - "--log.level=${LOG_LEVEL:-INFO}"
+      # Docker provider
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=xorng-network"
+      # Entry points
       - "--entrypoints.web.address=:80"
-      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       - "--entrypoints.websecure.address=:443"
+      # ACME / Let's Encrypt - HTTP Challenge
+      # NOTE: Do NOT redirect HTTP globally when using HTTP challenge!
+      # The ACME challenge needs port 80 accessible at /.well-known/acme-challenge/
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@${AUTOMATION_DOMAIN}}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-      - "--log.level=${LOG_LEVEL:-INFO}"
     ports:
       - "80:80"
       - "443:443"
+      - "8080:8080"  # Traefik dashboard for debugging
     volumes:
       - letsencrypt:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -68,12 +74,19 @@ services:
     networks:
       - xorng-network
     labels:
+      # HTTPS Router
       - "traefik.enable=true"
       - "traefik.http.routers.automation.rule=Host(`${AUTOMATION_DOMAIN}`)"
       - "traefik.http.routers.automation.entrypoints=websecure"
       - "traefik.http.routers.automation.tls=true"
       - "traefik.http.routers.automation.tls.certresolver=letsencrypt"
       - "traefik.http.services.automation.loadbalancer.server.port=3000"
+      # HTTP to HTTPS redirect (at router level, not global - allows ACME challenge)
+      - "traefik.http.routers.automation-http.rule=Host(`${AUTOMATION_DOMAIN}`)"
+      - "traefik.http.routers.automation-http.entrypoints=web"
+      - "traefik.http.middlewares.automation-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.automation-redirect.redirectscheme.permanent=true"
+      - "traefik.http.routers.automation-http.middlewares=automation-redirect"
     ports:
       - "${AUTOMATION_PORT:-3001}:3000"
 
