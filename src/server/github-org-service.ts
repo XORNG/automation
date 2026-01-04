@@ -232,11 +232,24 @@ export class GitHubOrgService {
 
   /**
    * Register webhook for a repository
+   * 
+   * Default events include CI-related events for self-healing pipeline:
+   * - check_run, check_suite, workflow_run: For CI status monitoring
+   * - pull_request, issue_comment: For PR lifecycle and commands
+   * - push: For code change tracking
    */
   async registerWebhook(
     repoName: string,
     webhookUrl: string,
-    events: string[] = ['issues', 'issue_comment', 'pull_request', 'pull_request_review', 'push'],
+    events: string[] = [
+      'check_run',       // Individual CI check status
+      'check_suite',     // Grouped CI check status
+      'workflow_run',    // GitHub Actions workflow status
+      'pull_request',    // PR lifecycle events
+      'issue_comment',   // Commands like /autofix, /approve, /merge
+      'pull_request_review', // Review status
+      'push',            // Code changes
+    ],
     secret?: string
   ): Promise<{ id: number; active: boolean }> {
     const { data: hook } = await this.octokit.repos.createWebhook({
@@ -266,10 +279,19 @@ export class GitHubOrgService {
 
   /**
    * Register webhook for all repositories in the organization
+   * 
+   * Default events include CI-related events for self-healing pipeline.
    */
   async registerWebhooksForAll(
     webhookUrl: string,
-    events: string[] = ['issues', 'issue_comment', 'pull_request', 'pull_request_review'],
+    events: string[] = [
+      'check_run',       // Individual CI check status
+      'check_suite',     // Grouped CI check status  
+      'workflow_run',    // GitHub Actions workflow status
+      'pull_request',    // PR lifecycle events
+      'issue_comment',   // Commands like /autofix, /approve, /merge
+      'pull_request_review', // Review status
+    ],
     secret?: string
   ): Promise<Array<{ repo: string; hookId?: number; error?: string }>> {
     const repositories = await this.listRepositories();

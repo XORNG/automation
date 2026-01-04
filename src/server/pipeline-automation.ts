@@ -1060,6 +1060,112 @@ _This ensures clean git history and prevents conflicting automated changes._`;
   }
 
   /**
+   * Trigger PR analysis from external sources (e.g., MultiRepoScanner)
+   * 
+   * This method allows programmatic triggering of the self-healing pipeline
+   * for a specific PR. It's used by the MultiRepoScanner to process PRs
+   * discovered during periodic scans.
+   * 
+   * @param owner - Repository owner
+   * @param repo - Repository name
+   * @param prNumber - Pull request number
+   */
+  async triggerPRAnalysis(owner: string, repo: string, prNumber: number): Promise<void> {
+    this.logger.info({
+      owner,
+      repo,
+      prNumber,
+      source: 'scanner',
+    }, 'Triggering PR analysis from scanner');
+    
+    // Check if auto-fix is enabled and attempts available
+    if (!this.enableAutoFix) {
+      this.logger.info({ owner, repo, prNumber }, 'Auto-fix disabled, skipping scanner-triggered analysis');
+      return;
+    }
+    
+    if (!this.canAttemptFix(repo, prNumber)) {
+      this.logger.info({
+        owner,
+        repo,
+        prNumber,
+      }, 'Auto-fix limit reached, skipping scanner-triggered analysis');
+      return;
+    }
+    
+    // Try to acquire lock for this repo
+    const lockAcquired = this.tryAcquireRepoLock(owner, repo, prNumber);
+    
+    if (!lockAcquired) {
+      this.logger.info({
+        owner,
+        repo,
+        prNumber,
+        activePR: this.getActiveFixPR(repo),
+      }, 'Another PR is being fixed in this repo, scanner-triggered PR queued');
+      return;
+    }
+    
+    this.logger.info({
+      owner,
+      repo,
+      prNumber,
+    }, 'Acquired repo lock, triggering analysis from scanner');
+    
+    try {
+      // Get the PR's failing checks
+      const { data: checkRuns } = await this.octokit.checks.listForRef({
+        owner,
+        repo,
+        ref: `pull/${prNumber}/head`,
+      });
+      
+      // Find the first failed check to trigger analysis
+      const failedCheck = checkRuns.check_runs.find(
+        c => c.status === 'completed' && 
+             (c.conclusion === 'failure' || c.conclusion === 'timed_out')
+      );
+      
+      if (!failedCheck) {
+        this.logger.info({
+          owner,
+          repo,
+          prNumber,
+        }, 'No failed checks found during scanner analysis - PR may have been fixed');
+        this.releaseRepoLock(repo, prNumber);
+        return;
+      }
+      
+      // Trigger processing through the pipeline monitor
+      await this.pipelineMonitor.processCheckRunEvent({
+        action: 'completed',
+        check_run: {
+          id: failedCheck.id,
+          name: failedCheck.name,
+          status: failedCheck.status,
+          conclusion: failedCheck.conclusion as string,
+          pull_requests: [{ number: prNumber }],
+        },
+        repository: {
+          name: repo,
+          owner: { login: owner },
+        },
+      });
+      
+      this.emit('scanner:pr-analyzed', { owner, repo, prNumber, checkName: failedCheck.name });
+    } catch (error) {
+      this.logger.error({
+        error,
+        owner,
+        repo,
+        prNumber,
+      }, 'Failed to trigger PR analysis from scanner');
+      this.releaseRepoLock(repo, prNumber);
+      throw error;
+    }
+  }
+
+  /**
    * Get automation statistics
    */
   getStats(): {

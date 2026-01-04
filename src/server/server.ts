@@ -23,6 +23,8 @@ import { AIService, createAIServiceFromEnv } from './ai-service.js';
 import { QueueService, createQueueServiceFromEnv, type JobData, type JobResult } from './queue-service.js';
 import { metricsService, metricsRegistry } from './metrics.js';
 import { CircuitBreaker, circuitBreakerRegistry } from '../utils/circuit-breaker.js';
+import { PipelineAutomation } from './pipeline-automation.js';
+import { MultiRepoScanner } from './multi-repo-scanner.js';
 import { pino } from 'pino';
 
 const logger = pino({
@@ -54,6 +56,10 @@ interface ServerConfig {
   aiEnabled: boolean;
   // Metrics
   metricsEnabled: boolean;
+  // Pipeline automation
+  pipelineEnabled: boolean;
+  botUsername: string;
+  scanIntervalMs: number;
 }
 
 /**
@@ -81,6 +87,10 @@ function loadConfig(): ServerConfig {
     aiEnabled: !!process.env.OPENROUTER_API_KEY,
     // Metrics
     metricsEnabled: process.env.METRICS_ENABLED !== 'false',
+    // Pipeline automation (self-healing)
+    pipelineEnabled: process.env.PIPELINE_ENABLED !== 'false',
+    botUsername: process.env.BOT_USERNAME || 'xorng-bot',
+    scanIntervalMs: parseInt(process.env.SCAN_INTERVAL_MS || '300000', 10), // 5 minutes default
   };
 
   if (!config.githubToken) {
@@ -103,6 +113,8 @@ export class AutomationServer {
   private serviceOrchestrator?: ServiceOrchestrator;
   private aiService: AIService;
   private queueService?: QueueService;
+  private pipelineAutomation?: PipelineAutomation;
+  private multiRepoScanner?: MultiRepoScanner;
   private isShuttingDown = false;
   private cleanupIntervals: NodeJS.Timeout[] = [];
   
@@ -188,6 +200,35 @@ export class AutomationServer {
       });
     }
 
+    // Initialize pipeline automation (self-healing CI/CD)
+    if (config.pipelineEnabled && config.aiEnabled) {
+      this.pipelineAutomation = new PipelineAutomation({
+        token: config.githubToken,
+        organization: config.githubOrganization,
+        aiService: this.aiService,
+        webhookServer: this.webhookServer,
+        botUsername: config.botUsername,
+        enableAutoFix: true,
+        enableMergeApproval: true,
+        logLevel: config.logLevel,
+      });
+
+      // Initialize multi-repo scanner for comprehensive coverage
+      this.multiRepoScanner = new MultiRepoScanner({
+        token: config.githubToken,
+        organization: config.githubOrganization,
+        githubOrgService: this.githubOrgService,
+        pipelineAutomation: this.pipelineAutomation,
+        scanIntervalMs: config.scanIntervalMs,
+        enablePeriodicScan: true,
+        maxConcurrentScans: 5,
+        logLevel: config.logLevel,
+      });
+
+      // Setup pipeline event logging
+      this.setupPipelineEventHandlers();
+    }
+
     this.setupEventHandlers();
   }
 
@@ -207,6 +248,85 @@ export class AutomationServer {
         metricsService.recordCircuitBreakerFailure(breaker.getStats().name);
       });
     }
+  }
+
+  /**
+   * Setup pipeline automation event handlers for logging and metrics
+   */
+  private setupPipelineEventHandlers(): void {
+    if (!this.pipelineAutomation || !this.multiRepoScanner) return;
+
+    // Pipeline automation events
+    this.pipelineAutomation.on('fix:applied', (data) => {
+      logger.info({
+        owner: data.owner,
+        repo: data.repo,
+        prNumber: data.prNumber,
+      }, 'Pipeline fix applied');
+    });
+
+    this.pipelineAutomation.on('fix:successful', (data) => {
+      logger.info({
+        owner: data.owner,
+        repo: data.repo,
+        prNumber: data.prNumber,
+      }, 'Pipeline fix was successful - CI passing');
+    });
+
+    this.pipelineAutomation.on('fix:failed', (data) => {
+      logger.warn({
+        owner: data.owner,
+        repo: data.repo,
+        prNumber: data.prNumber,
+        error: data.error,
+      }, 'Pipeline fix failed');
+    });
+
+    this.pipelineAutomation.on('merge:completed', (data) => {
+      logger.info({
+        owner: data.owner,
+        repo: data.repo,
+        prNumber: data.prNumber,
+      }, 'PR merged successfully');
+    });
+
+    this.pipelineAutomation.on('scanner:pr-analyzed', (data) => {
+      logger.info({
+        owner: data.owner,
+        repo: data.repo,
+        prNumber: data.prNumber,
+        checkName: data.checkName,
+      }, 'Scanner-triggered PR analysis completed');
+    });
+
+    // Multi-repo scanner events
+    this.multiRepoScanner.on('scan:started', () => {
+      logger.info('Multi-repo scan started');
+    });
+
+    this.multiRepoScanner.on('scan:completed', (result) => {
+      logger.info({
+        totalRepos: result.totalRepos,
+        reposScanned: result.reposScanned,
+        totalOpenPRs: result.totalOpenPRs,
+        failingPRs: result.failingPRs,
+        processedPRs: result.processedPRs,
+        errors: result.errors.length,
+      }, 'Multi-repo scan completed');
+    });
+
+    this.multiRepoScanner.on('scan:error', (error) => {
+      logger.error({ error }, 'Multi-repo scan error');
+    });
+
+    this.multiRepoScanner.on('pr:found', (pr) => {
+      logger.info({
+        owner: pr.owner,
+        repo: pr.repo,
+        prNumber: pr.number,
+        failedChecks: pr.failedChecks,
+      }, 'Found PR with failing checks during scan');
+    });
   }
 
   /**
@@ -387,7 +507,16 @@ export class AutomationServer {
       logger.info({ webhookUrl: this.config.webhookUrl }, 'Registering webhooks for all repositories');
       const results = await this.githubOrgService.registerWebhooksForAll(
         this.config.webhookUrl,
-        ['issues', 'issue_comment', 'pull_request', 'pull_request_review'],
+        // Include CI events for self-healing pipeline
+        [
+          'check_run',       // Individual CI check status
+          'check_suite',     // Grouped CI check status
+          'workflow_run',    // GitHub Actions workflow status
+          'pull_request',    // PR lifecycle events
+          'issue_comment',   // Commands like /autofix, /approve, /merge
+          'pull_request_review', // Review status
+          'issues',          // Issue lifecycle events
+        ],
         this.config.webhookSecret
       );
 
@@ -429,7 +558,16 @@ export class AutomationServer {
               await this.githubOrgService.registerWebhook(
                 repo.name,
                 this.config.webhookUrl,
-                ['issues', 'issue_comment', 'pull_request', 'pull_request_review'],
+                // Include CI events for self-healing pipeline
+                [
+                  'check_run',
+                  'check_suite',
+                  'workflow_run',
+                  'pull_request',
+                  'issue_comment',
+                  'pull_request_review',
+                  'issues',
+                ],
                 this.config.webhookSecret
               );
               logger.info({ repo: repo.name }, 'Registered webhook for new repository');
@@ -468,6 +606,17 @@ export class AutomationServer {
         // Don't crash the server if orchestrator fails - log and continue
         logger.error({ error }, 'Service orchestrator failed to start, continuing without it');
       }
+    }
+
+    // Start multi-repo scanner for self-healing pipeline
+    if (this.multiRepoScanner && this.config.pipelineEnabled) {
+      logger.info({
+        scanIntervalMs: this.config.scanIntervalMs,
+      }, 'Starting multi-repo scanner for self-healing pipeline...');
+      
+      this.multiRepoScanner.start();
+      
+      logger.info('Multi-repo scanner started - will scan all repos for failing PRs');
     }
 
     logger.info('XORNG Automation Server started successfully');
@@ -599,17 +748,23 @@ export class AutomationServer {
     }
     this.cleanupIntervals = [];
 
-    // 2. Stop service orchestrator
+    // 2. Stop multi-repo scanner
+    if (this.multiRepoScanner) {
+      logger.info('Stopping multi-repo scanner...');
+      this.multiRepoScanner.stop();
+    }
+
+    // 3. Stop service orchestrator
     if (this.serviceOrchestrator) {
       logger.info('Stopping service orchestrator...');
       this.serviceOrchestrator.stop();
     }
 
-    // 3. Stop webhook server (stop accepting new requests)
+    // 4. Stop webhook server (stop accepting new requests)
     logger.info('Stopping webhook server...');
     await this.webhookServer.stop();
 
-    // 4. Wait for queue to drain active jobs
+    // 5. Wait for queue to drain active jobs
     if (this.queueService) {
       logger.info('Draining job queue...');
       try {
@@ -620,7 +775,7 @@ export class AutomationServer {
       }
     }
 
-    // 5. Final cleanup
+    // 6. Final cleanup
     logger.info('Shutdown complete');
   }
 
@@ -636,6 +791,8 @@ export class AutomationServer {
       serviceOrchestrator: this.serviceOrchestrator,
       aiService: this.aiService,
       queueService: this.queueService,
+      pipelineAutomation: this.pipelineAutomation,
+      multiRepoScanner: this.multiRepoScanner,
     };
   }
 

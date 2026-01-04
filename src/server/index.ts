@@ -8,6 +8,7 @@ import { metricsService, metricsRegistry, type MetricsService } from './metrics.
 import { PipelineMonitor, type PipelineMonitorConfig, type PRPipelineStatus, type PipelineFailureAnalysis, type PipelineFixResult } from './pipeline-monitor.js';
 import { MergeApprovalService, type MergeApprovalConfig, type MergeApprovalRequest } from './merge-approval.js';
 import { PipelineAutomation, type PipelineAutomationConfig } from './pipeline-automation.js';
+import { MultiRepoScanner, type MultiRepoScannerConfig, type FailingPR, type ScanResult } from './multi-repo-scanner.js';
 
 export { WebhookServer, type WebhookServerConfig };
 export { FeedbackService };
@@ -19,4 +20,5 @@ export { metricsService, metricsRegistry, type MetricsService };
 export { PipelineMonitor, type PipelineMonitorConfig, type PRPipelineStatus, type PipelineFailureAnalysis, type PipelineFixResult };
 export { MergeApprovalService, type MergeApprovalConfig, type MergeApprovalRequest };
 export { PipelineAutomation, type PipelineAutomationConfig };
+export { MultiRepoScanner, type MultiRepoScannerConfig, type FailingPR, type ScanResult };
 
