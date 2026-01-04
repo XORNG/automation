@@ -1,56 +1,29 @@
 services:
   # ===========================================
-  # Docker Socket Proxy (handles API version negotiation)
-  # Required because Traefik's internal Docker client doesn't respect
-  # DOCKER_API_VERSION env var and uses hardcoded 1.24
-  # ===========================================
-  dockerproxy:
-    image: tecnativa/docker-socket-proxy:latest
-    container_name: dockerproxy
-    restart: unless-stopped
-    profiles:
-      - with-domain
-    privileged: true
-    environment:
-      # Grant read access to containers, networks, services for Traefik
-      - CONTAINERS=1
-      - NETWORKS=1
-      - SERVICES=1
-      - TASKS=1
-      - INFO=1
-      - VERSION=1
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - xorng-network
-
-  # ===========================================
   # Traefik Reverse Proxy (automatic HTTPS)
   # Only used when AUTOMATION_DOMAIN is set
   # ===========================================
   traefik:
-    image: traefik:v3.2
+    image: traefik:v2.11
     container_name: traefik
     restart: unless-stopped
     profiles:
       - with-domain  # Only starts when profile is active
-    depends_on:
-      - dockerproxy
     command:
       # API and Dashboard (for debugging)
       - "--api.insecure=true"
       - "--log.level=INFO"
-      # Docker provider - connect via socket proxy instead of direct socket
+      # Docker provider - direct socket mount (no proxy needed for v2.x)
       - "--providers.docker=true"
-      - "--providers.docker.endpoint=tcp://dockerproxy:2375"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=xorng-network"
       # Entry points
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
+      # HTTP to HTTPS redirect at entrypoint level
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       # ACME / Let's Encrypt - HTTP Challenge
-      # NOTE: Do NOT redirect HTTP globally when using HTTP challenge!
-      # The ACME challenge needs port 80 accessible at /.well-known/acme-challenge/
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@${AUTOMATION_DOMAIN}}"
@@ -60,6 +33,7 @@ services:
       - "443:443"
       - "8080:8080"  # Traefik dashboard for debugging
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
     networks:
       - xorng-network
@@ -109,14 +83,6 @@ services:
       - "traefik.http.routers.automation.tls=true"
       - "traefik.http.routers.automation.tls.certresolver=letsencrypt"
       - "traefik.http.services.automation.loadbalancer.server.port=3000"
-      # HTTP Router for ACME challenge (NO redirect - required for Let's Encrypt)
-      - "traefik.http.routers.automation-http.rule=Host(`${AUTOMATION_DOMAIN}`)"
-      - "traefik.http.routers.automation-http.entrypoints=web"
-      - "traefik.http.routers.automation-http.service=automation"
-      # HTTP to HTTPS redirect middleware (applied AFTER ACME challenge paths)
-      - "traefik.http.middlewares.automation-redirect.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.automation-redirect.redirectscheme.permanent=true"
-      - "traefik.http.routers.automation-http.middlewares=automation-redirect"
     ports:
       - "${AUTOMATION_PORT:-3001}:3000"
 
