@@ -139,9 +139,18 @@ jobs:
               echo "=== Debug: Docker Networks ==="
               docker network ls
               
-              # Force recreate containers to pick up new labels
-              docker compose --profile with-domain down
+              # Stop and remove orphan containers from previous deployments
+              echo "=== Cleaning up orphan containers ==="
+              docker stop dockerproxy 2>/dev/null || true
+              docker rm dockerproxy 2>/dev/null || true
+              
+              # Force recreate containers to pick up new labels (with orphan removal)
+              docker compose --profile with-domain down --remove-orphans
               docker compose --profile with-domain up -d --force-recreate
+              
+              # Clean up orphaned networks
+              echo "=== Cleaning up orphan networks ==="
+              docker network prune -f 2>/dev/null || true
               
               # Debug: Show container labels
               echo "=== Debug: Container labels ==="

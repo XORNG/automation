@@ -20,10 +20,9 @@ services:
       # Entry points
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
-      # HTTP to HTTPS redirect at entrypoint level
-      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       # ACME / Let's Encrypt - HTTP Challenge
+      # NOTE: Do NOT use entrypoint-level redirects with HTTP challenge!
+      # The ACME challenge needs port 80 accessible without redirect
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
       - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@${AUTOMATION_DOMAIN}}"
@@ -75,14 +74,22 @@ services:
     networks:
       - xorng-network
     labels:
-      # HTTPS Router
+      # Enable Traefik for this container
       - "traefik.enable=true"
       - "traefik.docker.network=xorng-network"
+      # HTTPS Router (main)
       - "traefik.http.routers.automation.rule=Host(`${AUTOMATION_DOMAIN}`)"
       - "traefik.http.routers.automation.entrypoints=websecure"
       - "traefik.http.routers.automation.tls=true"
       - "traefik.http.routers.automation.tls.certresolver=letsencrypt"
       - "traefik.http.services.automation.loadbalancer.server.port=3000"
+      # HTTP Router (for redirect, excludes ACME paths which are handled by Traefik internally)
+      - "traefik.http.routers.automation-http.rule=Host(`${AUTOMATION_DOMAIN}`)"
+      - "traefik.http.routers.automation-http.entrypoints=web"
+      - "traefik.http.routers.automation-http.middlewares=https-redirect"
+      # Redirect middleware
+      - "traefik.http.middlewares.https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.https-redirect.redirectscheme.permanent=true"
     ports:
       - "${AUTOMATION_PORT:-3001}:3000"
 
