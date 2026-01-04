@@ -20,7 +20,6 @@
     "test": "vitest"
   },
   "dependencies": {
-    "@xorng/core": "workspace:*",
     "@octokit/rest": "^20.0.2",
     "dockerode": "^4.0.2",
     "express": "^4.18.2",
