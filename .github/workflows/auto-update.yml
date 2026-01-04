@@ -1,0 +1,51 @@
+name: Auto-update XORNG Automation
+
+on:
+  schedule:
+    # Check for updates every day at 3 AM UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/xorng-automation
+
+jobs:
+  check-and-update:
+    name: Check for Updates and Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Check for new commits
+        id: check
+        run: |
+          # Get last deployed commit from VServer
+          DEPLOYED_COMMIT=$(curl -s http://${{ secrets.VSERVER_HOST }}:3000/status 2>/dev/null | jq -r '.version // empty' || echo "")
+          CURRENT_COMMIT="${{ github.sha }}"
+          
+          if [ "$DEPLOYED_COMMIT" != "$CURRENT_COMMIT" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "New version available"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "Already up to date"
+          fi
+
+      - name: Trigger deployment
+        if: steps.check.outputs.update_needed == 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          event-type: auto-update
+          client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'
+
+      - name: Update summary
+        run: |
+          echo "## Auto-update Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check.outputs.update_needed }}" == "true" ]; then
+            echo "🔄 Update triggered" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ System is up to date" >> $GITHUB_STEP_SUMMARY
+          fi

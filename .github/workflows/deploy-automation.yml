@@ -1,0 +1,211 @@
+name: Deploy XORNG Automation Server
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'automation/**'
+      - '.github/workflows/deploy-automation.yml'
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even without changes'
+        required: false
+        default: 'false'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/xorng-automation
+
+jobs:
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./automation
+          file: ./automation/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VServer
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Copy docker-compose to VServer
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VSERVER_HOST }}
+          username: ${{ secrets.VSERVER_USER }}
+          key: ${{ secrets.VSERVER_SSH_KEY }}
+          port: ${{ secrets.VSERVER_PORT || 22 }}
+          source: "automation/docker-compose.yml"
+          target: "/opt/xorng"
+          strip_components: 1
+
+      - name: Deploy via Docker Compose
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VSERVER_HOST }}
+          username: ${{ secrets.VSERVER_USER }}
+          key: ${{ secrets.VSERVER_SSH_KEY }}
+          port: ${{ secrets.VSERVER_PORT || 22 }}
+          script: |
+            set -e
+            cd /opt/xorng
+            
+            # Create .env file with secrets
+            cat > .env << 'EOF'
+            GITHUB_TOKEN=${{ secrets.GH_AUTOMATION_TOKEN }}
+            GITHUB_ORG=${{ secrets.GITHUB_ORG }}
+            WEBHOOK_SECRET=${{ secrets.WEBHOOK_SECRET }}
+            AUTOMATION_DOMAIN=${{ secrets.AUTOMATION_DOMAIN }}
+            ACME_EMAIL=${{ secrets.ACME_EMAIL }}
+            LOG_LEVEL=${{ secrets.LOG_LEVEL || 'info' }}
+            AUTOMATION_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            EOF
+            
+            # Pull latest image
+            echo "Pulling latest image..."
+            docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+            
+            # Determine deployment mode
+            DOMAIN="${{ secrets.AUTOMATION_DOMAIN }}"
+            
+            if [ -n "$DOMAIN" ]; then
+              echo "=========================================="
+              echo "Deploying WITH domain: $DOMAIN"
+              echo "Traefik + automatic HTTPS enabled"
+              echo "=========================================="
+              
+              # Add webhook URL to .env
+              echo "WEBHOOK_URL=https://${DOMAIN}/webhook/github" >> .env
+              
+              # Deploy with Traefik profile
+              docker compose --profile with-domain up -d --remove-orphans
+            else
+              echo "=========================================="
+              echo "Deploying WITHOUT domain"
+              echo "Direct port access on :3001"
+              echo "=========================================="
+              
+              # Add webhook URL from secret
+              echo "WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}" >> .env
+              
+              # Deploy without Traefik
+              docker compose up -d automation-server redis --remove-orphans
+            fi
+            
+            # Cleanup
+            docker image prune -f
+            
+            # Health check
+            echo "Waiting for service to start..."
+            sleep 15
+            
+            if [ -n "$DOMAIN" ]; then
+              # Try HTTPS, fallback to container check
+              if curl -sf "https://${DOMAIN}/health" > /dev/null 2>&1; then
+                echo "✅ Service healthy at https://${DOMAIN}"
+              else
+                echo "Checking container health..."
+                docker compose exec -T automation-server wget -q --spider http://localhost:3000/health || exit 1
+                echo "✅ Container healthy (SSL may still be provisioning)"
+              fi
+            else
+              curl -sf http://localhost:3001/health || exit 1
+              echo "✅ Service healthy at http://localhost:3001"
+            fi
+            
+            echo ""
+            echo "=========================================="
+            echo "Deployment successful!"
+            echo "=========================================="
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VSERVER_HOST }}
+          username: ${{ secrets.VSERVER_USER }}
+          key: ${{ secrets.VSERVER_SSH_KEY }}
+          port: ${{ secrets.VSERVER_PORT || 22 }}
+          script: |
+            cd /opt/xorng
+            
+            echo "=== Container Status ==="
+            docker compose ps
+            
+            echo ""
+            echo "=== XORNG Automation Logs (last 20 lines) ==="
+            docker compose logs --tail 20 automation-server
+            
+            echo ""
+            echo "=== Traefik Status (if running) ==="
+            docker compose logs --tail 5 traefik 2>/dev/null || echo "Traefik not running (no domain configured)"
+
+  notify:
+    name: Send Notification
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Create deployment summary
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ secrets.AUTOMATION_DOMAIN }}" ]; then
+            echo "**URL:** https://${{ secrets.AUTOMATION_DOMAIN }}" >> $GITHUB_STEP_SUMMARY
+          fi
