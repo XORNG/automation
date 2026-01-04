@@ -250,16 +250,16 @@ jobs:
           script: |
             cd /opt/xorng
             
-            echo "=== Container Status ===""
+            echo "=== Container Status ==="
             docker compose ps
             
             echo ""
-            echo "=== XORNG Automation Logs (last 20 lines) ==="
+            echo "=== Automation Logs - last 20 lines ==="
             docker compose logs --tail 20 automation-server
             
             echo ""
-            echo "=== Traefik Status (if running) ==="
-            docker compose logs --tail 5 traefik 2>/dev/null || echo "Traefik not running (no domain configured)"
+            echo "=== Traefik Status ==="
+            docker compose logs --tail 5 traefik 2>/dev/null || echo "Traefik not running"
 
   notify:
     name: Send Notification
