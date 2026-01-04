@@ -5,7 +5,10 @@ on:
     branches:
       - main
     paths:
-      - 'automation/**'
+      - 'src/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'package.json'
       - '.github/workflows/deploy-automation.yml'
   workflow_dispatch:
     inputs:
@@ -57,8 +60,8 @@ jobs:
         id: build
         uses: docker/build-push-action@v5
         with:
-          context: ./automation
-          file: ./automation/Dockerfile
+          context: .
+          file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -82,9 +85,8 @@ jobs:
           username: ${{ secrets.VSERVER_USER }}
           key: ${{ secrets.VSERVER_SSH_KEY }}
           port: ${{ secrets.VSERVER_PORT || 22 }}
-          source: "automation/docker-compose.yml"
+          source: "docker-compose.yml"
           target: "/opt/xorng"
-          strip_components: 1
 
       - name: Deploy via Docker Compose
         uses: appleboy/ssh-action@v1.0.3
