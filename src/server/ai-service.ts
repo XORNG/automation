@@ -109,12 +109,10 @@ export class AIService extends EventEmitter {
   private static readonly DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
   
   // Default fallback models (FREE models on OpenRouter - no cost)
-  // These are high-quality open-source models available at $0/token
+  // OpenRouter limits models array to 3 items max (1 primary + 2 fallbacks)
   private static readonly DEFAULT_FALLBACK_MODELS = [
     'xiaomi/mimo-v2-flash:free',          // MiMo-V2 MoE model, #1 on SWE-bench, 256K context
     'kwaipilot/kat-coder-pro:free',       // KAT-Coder-Pro, optimized for coding tasks
-    'tngtech/deepseek-r1t2-chimera:free', // DeepSeek R1T2 Chimera, strong reasoning
-    'nvidia/nemotron-3-nano-30b-a3b:free', // NVIDIA Nemotron, efficient agentic AI
   ];
 
   constructor(config: AIServiceConfig) {
