@@ -359,11 +359,10 @@ export class AutomationServer {
 
     // Start queue service if enabled
     if (this.queueService) {
-      logger.info('Starting BullMQ queue service...');
-      this.queueService.startWorker(async (job) => {
-        return this.processQueueJob(job.data);
-      });
-      
+const processor = async (job: Job<JobData, any, string>): Promise<JobResult> => {
+  // Process the job
+  return { status: 'completed' };
+};
       // Setup queue event metrics
       this.queueService.on('job:completed', () => {
         this.updateQueueMetrics();

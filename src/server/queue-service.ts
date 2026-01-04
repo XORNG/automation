@@ -1,23 +1,20 @@
-import { Queue, Worker, Job, QueueScheduler, QueueEvents, type ConnectionOptions } from 'bullmq';
-import { pino, type Logger } from 'pino';
-import { EventEmitter } from 'events';
-import crypto from 'crypto';
+export enum JobType {
+  ISSUE_PROCESSING = 'issue_processing',
+  FEEDBACK = 'feedback',
+  OTHER = 'other'
+}
 
-/**
- * Job data for issue processing
- */
-export interface IssueJobData {
-  id: number;
-  number: number;
-  title: string;
-  body: string | null;
-  state: string;
-  labels: Array<{ name: string; color: string }>;
-  author: string;
-  repository: string;
-  repositoryOwner: string;
-  htmlUrl: string;
-  createdAt: string;
+export enum JobPriority {
+  HIGH = 1,
+  MEDIUM = 2,
+  LOW = 3
+}
+
+export interface QueueConfig {
+  host: string;
+  port: number;
+  password?: string;
+}
   updatedAt: string;
   action: string;
 }
