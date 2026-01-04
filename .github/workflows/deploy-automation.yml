@@ -153,23 +153,41 @@ jobs:
             # Cleanup
             docker image prune -f
             
-            # Health check
+            # Health check with retry logic
             echo "Waiting for service to start..."
-            sleep 15
+            MAX_RETRIES=6
+            RETRY_INTERVAL=10
             
-            if [ -n "$DOMAIN" ]; then
-              # Try HTTPS, fallback to container check
-              if curl -sf "https://${DOMAIN}/health" > /dev/null 2>&1; then
-                echo "✅ Service healthy at https://${DOMAIN}"
+            for i in $(seq 1 $MAX_RETRIES); do
+              echo "Health check attempt $i/$MAX_RETRIES..."
+              sleep $RETRY_INTERVAL
+              
+              if [ -n "$DOMAIN" ]; then
+                # Try HTTPS first
+                if curl -sf "https://${DOMAIN}/health" > /dev/null 2>&1; then
+                  echo "✅ Service healthy at https://${DOMAIN}"
+                  break
+                fi
+                # Fallback to container check
+                if docker compose exec -T automation-server wget -q --spider http://localhost:3000/health 2>/dev/null; then
+                  echo "✅ Container healthy (SSL may still be provisioning)"
+                  break
+                fi
               else
-                echo "Checking container health..."
-                docker compose exec -T automation-server wget -q --spider http://localhost:3000/health || exit 1
-                echo "✅ Container healthy (SSL may still be provisioning)"
+                if curl -sf http://localhost:3001/health 2>/dev/null; then
+                  echo "✅ Service healthy at http://localhost:3001"
+                  break
+                fi
               fi
-            else
-              curl -sf http://localhost:3001/health || exit 1
-              echo "✅ Service healthy at http://localhost:3001"
-            fi
+              
+              if [ $i -eq $MAX_RETRIES ]; then
+                echo "❌ Health check failed after $MAX_RETRIES attempts"
+                docker logs xorng-automation --tail 50
+                exit 1
+              fi
+              
+              echo "Service not ready yet, retrying..."
+            done
             
             echo ""
             echo "=========================================="
