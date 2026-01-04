@@ -125,19 +125,29 @@ export class ServiceOrchestrator {
   async discoverAndDeploy(): Promise<void> {
     this.logger.info('Starting service discovery...');
     
-    const services = await this.discoverServices();
-    const running = await this.getRunningServices();
-    
-    for (const service of services) {
-      const isRunning = running.some(r => r.name === `xorng-${service.name}`);
+    try {
+      const services = await this.discoverServices();
+      const running = await this.getRunningServices();
       
-      if (!isRunning && this.config.autoDeployEnabled) {
-        this.logger.info({ service: service.name }, 'Deploying new service');
-        await this.deployService(service);
+      for (const service of services) {
+        const isRunning = running.some(r => r.name === `xorng-${service.name}`);
+        
+        if (!isRunning && this.config.autoDeployEnabled) {
+          this.logger.info({ service: service.name }, 'Deploying new service');
+          try {
+            await this.deployService(service);
+          } catch (deployError) {
+            // Log but continue with other services
+            this.logger.error({ error: deployError, service: service.name }, 'Failed to deploy service, continuing...');
+          }
+        }
       }
+      
+      this.logger.info({ discovered: services.length, running: running.length }, 'Discovery complete');
+    } catch (error) {
+      this.logger.error({ error }, 'Error during service discovery');
+      throw error;
     }
-    
-    this.logger.info({ discovered: services.length, running: running.length }, 'Discovery complete');
   }
 
   /**

@@ -112,6 +112,7 @@ export class AutomationServer {
         githubToken: config.githubToken,
         organization: config.githubOrganization,
         registryUrl: config.registryUrl,
+        registryUsername: 'github', // GHCR uses 'github' as username with PAT as password
         registryPassword: config.githubToken, // Use same token for GHCR
         networkName: 'xorng-network',
         autoDeployEnabled: config.autoDeployServices,
@@ -313,14 +314,19 @@ export class AutomationServer {
     // Start service orchestrator if enabled
     if (this.serviceOrchestrator) {
       logger.info('Starting dynamic service orchestrator...');
-      await this.serviceOrchestrator.start(5 * 60 * 1000); // Poll every 5 minutes
-      
-      const status = await this.serviceOrchestrator.getStatus();
-      logger.info({
-        discovered: status.discovered.length,
-        running: status.running.length,
-        pending: status.pending.length,
-      }, 'Service orchestrator started');
+      try {
+        await this.serviceOrchestrator.start(5 * 60 * 1000); // Poll every 5 minutes
+        
+        const status = await this.serviceOrchestrator.getStatus();
+        logger.info({
+          discovered: status.discovered.length,
+          running: status.running.length,
+          pending: status.pending.length,
+        }, 'Service orchestrator started');
+      } catch (error) {
+        // Don't crash the server if orchestrator fails - log and continue
+        logger.error({ error }, 'Service orchestrator failed to start, continuing without it');
+      }
     }
 
     logger.info('XORNG Automation Server started successfully');

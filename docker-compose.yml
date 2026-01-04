@@ -39,6 +39,8 @@ services:
     image: ${AUTOMATION_IMAGE:-ghcr.io/xorng/xorng-automation:latest}
     container_name: xorng-automation
     restart: unless-stopped
+    # Run as root to access Docker socket (required for service orchestration)
+    user: root
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GH_ORG=${GH_ORG:-XORNG}
