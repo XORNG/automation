@@ -125,7 +125,7 @@ services:
   # Redis for memory/state and job queue
   # ===========================================
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     container_name: xorng-redis
     restart: unless-stopped
     volumes:
