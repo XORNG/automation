@@ -891,12 +891,13 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
     if (attempts >= (this.config.maxFixAttempts || 3)) {
       this.logger.warn({ prKey, attempts }, 'Max fix attempts reached, skipping auto-fix');
       
-      // Post a comment explaining the situation
-      await this.postComment(owner, repo, prNumber, 
+      // Post a comment explaining the situation (upsert to avoid spam)
+      await this.upsertComment(owner, repo, prNumber, 
         `## ⚠️ Auto-Fix Limit Reached\n\n` +
         `The automation system has attempted to fix pipeline failures ${attempts} times but the issues persist.\n\n` +
         `**Human intervention required.**\n\n` +
-        `Please review the failing checks and fix manually, or comment \`/autofix\` to allow additional fix attempts.`
+        `Please review the failing checks and fix manually, or comment \`/autofix\` to allow additional fix attempts.`,
+        PipelineMonitor.COMMENT_MARKERS.AUTO_FIX
       );
       return;
     }
@@ -963,11 +964,12 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
               issues: validatorIssues,
             }, 'Validator pre-check failed, skipping fix application');
             
-            await this.postComment(owner, repo, prNumber,
+            await this.upsertComment(owner, repo, prNumber,
               `## ⚠️ Auto-Fix Validation Failed\n\n` +
               `Generated fixes did not pass validation:\n` +
               validatorIssues.map(i => `- ${i}`).join('\n') +
-              `\n\n**Human intervention required.**`
+              `\n\n**Human intervention required.**`,
+              PipelineMonitor.COMMENT_MARKERS.AUTO_FIX
             );
             
             // Emit event so pipeline-automation can release lock and process queue
@@ -989,12 +991,13 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
       if (fixResult.success) {
         // Note: We don't call learnFromSuccess here because we need to wait
         // for the pipeline to actually pass. This is tracked in handlePRPipelineSuccess.
-        await this.postComment(owner, repo, prNumber,
+        await this.upsertComment(owner, repo, prNumber,
           `## 🔧 Auto-Fix Applied\n\n` +
           `Fixed ${fixResult.fixedIssues}/${fixResult.totalIssues} issues:\n\n` +
           fixResult.appliedFixes.map(f => `- **${f.file}**: ${f.description}`).join('\n') +
           `\n\nCommit: \`${fixResult.commitSha}\`\n\n` +
-          `*The pipeline will re-run automatically.*`
+          `*The pipeline will re-run automatically.*`,
+          PipelineMonitor.COMMENT_MARKERS.AUTO_FIX
         );
         
         // Emit event with learning tracking info
@@ -1010,10 +1013,11 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
         // Learn from the failure immediately since the fix couldn't even be applied
         await this.recordLearningFailure(owner, repo, prNumber, autoFixable, fixResult.error || 'Fix application failed');
         
-        await this.postComment(owner, repo, prNumber,
+        await this.upsertComment(owner, repo, prNumber,
           `## ❌ Auto-Fix Failed\n\n` +
           `Unable to apply fixes: ${fixResult.error}\n\n` +
-          `Please review the failing checks manually.`
+          `Please review the failing checks manually.`,
+          PipelineMonitor.COMMENT_MARKERS.AUTO_FIX
         );
         
         this.emit('fix:failed', {
@@ -1207,6 +1211,7 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
 
   /**
    * Post failure analysis comment
+   * Uses upsert pattern to update existing comment instead of creating spam
    */
   private async postFailureAnalysisComment(
     owner: string,
@@ -1251,11 +1256,13 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
 
     comment += `\n---\n*Analysis by XORNG Pipeline Monitor*`;
 
-    await this.postComment(owner, repo, prNumber, comment);
+    // Use upsert to update existing analysis comment instead of creating new ones
+    await this.upsertComment(owner, repo, prNumber, comment, PipelineMonitor.COMMENT_MARKERS.PIPELINE_ANALYSIS);
   }
 
   /**
    * Post merge approval request when all checks pass
+   * Uses upsert pattern to update existing comment instead of creating spam
    */
   private async postMergeApprovalRequest(
     owner: string,
@@ -1277,7 +1284,8 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
       `---\n*Human-in-the-loop approval required per XORNG guidelines.*\n` +
       `*Automation by XORNG Pipeline Monitor*`;
 
-    await this.postComment(owner, repo, prNumber, comment);
+    // Use upsert to update existing merge request comment
+    await this.upsertComment(owner, repo, prNumber, comment, PipelineMonitor.COMMENT_MARKERS.MERGE_REQUEST);
     
     // Add a label to indicate readiness
     await this.addLabel(owner, repo, prNumber, 'ready-for-review');
@@ -1450,17 +1458,109 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
     // Reset fix attempts
     this.fixAttempts.delete(prKey);
     
-    await this.postComment(owner, repo, prNumber,
+    // Use upsert to update the fix status comment
+    await this.upsertComment(owner, repo, prNumber,
       `## 🔧 Auto-Fix Triggered\n\n` +
       `@${sender} requested an automatic fix attempt.\n\n` +
-      `Analyzing pipeline failures...`
+      `Analyzing pipeline failures...`,
+      PipelineMonitor.COMMENT_MARKERS.FIX_TRIGGERED
     );
 
     await this.handlePRPipelineFailure(owner, repo, prNumber);
   }
 
   /**
-   * Post a comment on a PR
+   * Comment marker types for upsert operations
+   * Each marker identifies a specific type of bot comment to update instead of creating new ones
+   */
+  private static readonly COMMENT_MARKERS = {
+    PIPELINE_ANALYSIS: '<!-- XORNG-PIPELINE-ANALYSIS -->',
+    AUTO_FIX: '<!-- XORNG-AUTO-FIX -->',
+    MERGE_REQUEST: '<!-- XORNG-MERGE-REQUEST -->',
+    FIX_TRIGGERED: '<!-- XORNG-FIX-TRIGGERED -->',
+    INTERVENTION: '<!-- XORNG-INTERVENTION -->',
+  } as const;
+
+  /**
+   * Find an existing comment by marker
+   * Returns the comment ID if found, null otherwise
+   */
+  private async findCommentByMarker(
+    owner: string, 
+    repo: string, 
+    prNumber: number, 
+    marker: string
+  ): Promise<number | null> {
+    try {
+      const { data: comments } = await this.octokit.issues.listComments({
+        owner,
+        repo,
+        issue_number: prNumber,
+        per_page: 100,
+      });
+
+      const existingComment = comments.find(comment => 
+        comment.body?.includes(marker)
+      );
+
+      return existingComment?.id ?? null;
+    } catch (error) {
+      this.logger.warn({ error, owner, repo, prNumber, marker }, 'Failed to list comments for marker search');
+      return null;
+    }
+  }
+
+  /**
+   * Create or update a comment (upsert pattern)
+   * Best practice: Use markers to identify bot comments and update them instead of creating spam
+   * 
+   * @param owner Repository owner
+   * @param repo Repository name
+   * @param prNumber Pull request number
+   * @param body Comment body (marker will be prepended)
+   * @param marker Hidden HTML marker to identify the comment type
+   */
+  private async upsertComment(
+    owner: string, 
+    repo: string, 
+    prNumber: number, 
+    body: string,
+    marker: string
+  ): Promise<void> {
+    // Add timestamp to show when comment was last updated
+    const timestamp = new Date().toISOString();
+    const bodyWithMarker = `${marker}\n${body}\n\n<sub>Last updated: ${timestamp}</sub>`;
+
+    try {
+      const existingCommentId = await this.findCommentByMarker(owner, repo, prNumber, marker);
+
+      if (existingCommentId) {
+        // Update existing comment
+        await this.octokit.issues.updateComment({
+          owner,
+          repo,
+          comment_id: existingCommentId,
+          body: bodyWithMarker,
+        });
+        this.logger.debug({ owner, repo, prNumber, marker }, 'Updated existing comment');
+      } else {
+        // Create new comment
+        await this.octokit.issues.createComment({
+          owner,
+          repo,
+          issue_number: prNumber,
+          body: bodyWithMarker,
+        });
+        this.logger.debug({ owner, repo, prNumber, marker }, 'Created new comment');
+      }
+    } catch (error) {
+      this.logger.error({ error, owner, repo, prNumber, marker }, 'Failed to upsert comment');
+    }
+  }
+
+  /**
+   * Post a comment on a PR (creates a new comment)
+   * Use upsertComment for bot status updates to avoid comment spam
    */
   private async postComment(owner: string, repo: string, prNumber: number, body: string): Promise<void> {
     try {

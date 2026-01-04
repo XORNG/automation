@@ -451,6 +451,81 @@ export class MergeApprovalService extends EventEmitter {
   }
 
   /**
+   * Comment markers for upsert pattern
+   */
+  private static readonly COMMENT_MARKERS = {
+    APPROVAL_STATUS: '<!-- XORNG-APPROVAL-STATUS -->',
+    MERGE_STATUS: '<!-- XORNG-MERGE-STATUS -->',
+    HOLD_STATUS: '<!-- XORNG-HOLD-STATUS -->',
+  } as const;
+
+  /**
+   * Find an existing comment by marker
+   */
+  private async findCommentByMarker(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    marker: string
+  ): Promise<number | null> {
+    try {
+      const { data: comments } = await this.octokit.issues.listComments({
+        owner,
+        repo,
+        issue_number: prNumber,
+        per_page: 100,
+      });
+
+      const existingComment = comments.find(comment =>
+        comment.body?.includes(marker)
+      );
+
+      return existingComment?.id ?? null;
+    } catch (error) {
+      this.logger.warn({ error, owner, repo, prNumber, marker }, 'Failed to list comments for marker search');
+      return null;
+    }
+  }
+
+  /**
+   * Create or update a comment (upsert pattern)
+   */
+  private async upsertComment(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    body: string,
+    marker: string
+  ): Promise<void> {
+    const timestamp = new Date().toISOString();
+    const bodyWithMarker = `${marker}\n${body}\n\n<sub>Last updated: ${timestamp}</sub>`;
+
+    try {
+      const existingCommentId = await this.findCommentByMarker(owner, repo, prNumber, marker);
+
+      if (existingCommentId) {
+        await this.octokit.issues.updateComment({
+          owner,
+          repo,
+          comment_id: existingCommentId,
+          body: bodyWithMarker,
+        });
+        this.logger.debug({ owner, repo, prNumber, marker }, 'Updated existing comment');
+      } else {
+        await this.octokit.issues.createComment({
+          owner,
+          repo,
+          issue_number: prNumber,
+          body: bodyWithMarker,
+        });
+        this.logger.debug({ owner, repo, prNumber, marker }, 'Created new comment');
+      }
+    } catch (error) {
+      this.logger.error({ error, owner, repo, prNumber, marker }, 'Failed to upsert comment');
+    }
+  }
+
+  /**
    * Post a comment on the PR
    */
   private async postComment(owner: string, repo: string, prNumber: number, body: string): Promise<void> {

@@ -87,6 +87,51 @@ interface FixAttemptRecord {
 }
 
 /**
+ * Cross-repository learning issue - tracks issues that may need fixes in other repositories
+ * Example: Bad recommendation in knowledge-best-practices causing failures in core
+ */
+interface CrossRepoLearningIssue {
+  /** Repository where the symptom appeared (e.g., core) */
+  sourceRepo: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  };
+  /** Repository where the root cause is (e.g., knowledge-best-practices) */
+  targetRepo: {
+    owner: string;
+    repo: string;
+  };
+  /** Type of cross-repo issue */
+  issueType: 'knowledge-correction' | 'template-update' | 'dependency-fix' | 'config-change';
+  /** Detailed analysis of the root cause */
+  rootCauseAnalysis: string;
+  /** Suggested fix for the target repository */
+  suggestedFix?: string;
+}
+
+/**
+ * Root cause analysis result from AI
+ */
+interface RootCauseAnalysis {
+  /** Whether the issue is in the current repository */
+  isLocalIssue: boolean;
+  /** If cross-repo, which repository contains the root cause */
+  targetRepository?: {
+    owner: string;
+    repo: string;
+  };
+  /** Type of issue if cross-repo */
+  crossRepoIssueType?: CrossRepoLearningIssue['issueType'];
+  /** Detailed explanation of the root cause */
+  explanation: string;
+  /** Suggested fix description */
+  suggestedFix?: string;
+  /** Confidence level 0-1 */
+  confidence: number;
+}
+
+/**
  * Repository lock - ensures only one PR is being fixed at a time per repo
  * Prevents merge conflicts and duplicate fixes
  */
@@ -690,8 +735,9 @@ export class PipelineAutomation extends EventEmitter {
     
     if (!lockAcquired) {
       const activePR = this.getActiveFixPR(data.repo);
-      await this.postComment(data.owner, data.repo, data.prNumber,
-        `@${data.requester} Cannot start auto-fix right now. PR #${activePR} is currently being fixed in this repository.\n\nYour request has been queued and will be processed after PR #${activePR} is merged or its fix completes.`
+      await this.upsertComment(data.owner, data.repo, data.prNumber,
+        `@${data.requester} Cannot start auto-fix right now. PR #${activePR} is currently being fixed in this repository.\n\nYour request has been queued and will be processed after PR #${activePR} is merged or its fix completes.`,
+        PipelineAutomation.COMMENT_MARKERS.QUEUE_STATUS
       );
       return;
     }
@@ -707,15 +753,17 @@ export class PipelineAutomation extends EventEmitter {
     );
     
     if (status && status.allPassed) {
-      await this.postComment(data.owner, data.repo, data.prNumber,
-        `@${data.requester} All checks are already passing! ✅`
+      await this.upsertComment(data.owner, data.repo, data.prNumber,
+        `@${data.requester} All checks are already passing! ✅`,
+        PipelineAutomation.COMMENT_MARKERS.AUTO_FIX
       );
       return;
     }
     
     // Trigger autofix analysis
-    await this.postComment(data.owner, data.repo, data.prNumber,
-      `@${data.requester} Analyzing pipeline failures and attempting auto-fix... 🔧`
+    await this.upsertComment(data.owner, data.repo, data.prNumber,
+      `@${data.requester} Analyzing pipeline failures and attempting auto-fix... 🔧`,
+      PipelineAutomation.COMMENT_MARKERS.AUTO_FIX
     );
     
     await this.pipelineMonitor.handlePRPipelineFailure(
@@ -727,6 +775,7 @@ export class PipelineAutomation extends EventEmitter {
 
   /**
    * Notify that a PR is ready for merge
+   * Uses upsert pattern to avoid spamming merge-ready comments
    */
   private async notifyMergeReady(params: {
     owner: string;
@@ -734,25 +783,6 @@ export class PipelineAutomation extends EventEmitter {
     prNumber: number;
   }): Promise<void> {
     const { owner, repo, prNumber } = params;
-    
-    // Check if we already posted a merge-ready comment
-    const recentComments = await this.octokit.issues.listComments({
-      owner,
-      repo,
-      issue_number: prNumber,
-      per_page: 10,
-    });
-    
-    const hasRecentMergeComment = recentComments.data.some(c => 
-      c.user?.login === this.botUsername &&
-      c.body?.includes('ready to merge') &&
-      Date.now() - new Date(c.created_at).getTime() < 3600000 // Within last hour
-    );
-    
-    if (hasRecentMergeComment) {
-      this.logger.debug({ owner, repo, prNumber }, 'Skipping merge-ready notification (already posted)');
-      return;
-    }
     
     const message = `## ✅ Pipeline Checks Passing
 
@@ -767,13 +797,15 @@ All CI/CD checks have passed for this pull request.
 
 _Only users with write access can use these commands._`;
 
-    await this.postComment(owner, repo, prNumber, message);
+    // Use upsert to update existing merge-ready comment instead of creating new ones
+    await this.upsertComment(owner, repo, prNumber, message, PipelineAutomation.COMMENT_MARKERS.MERGE_READY);
     this.emit('merge:ready', { owner, repo, prNumber });
   }
 
   /**
-   * Request human intervention when auto-fix is not possible
-   */
+ * Request human intervention when auto-fix is not possible
+ * Follows learning-first approach: create tracking issue before requesting intervention
+ */
   private async requestHumanIntervention(params: {
     owner: string;
     repo: string;
@@ -787,6 +819,9 @@ _Only users with write access can use these commands._`;
     // Get fix attempt history
     const attempts = this.getFixAttempts(repo, prNumber);
     
+    // Create a learning issue to track this failure for future improvement
+    const learningIssueUrl = await this.createLearningIssue(params);
+    
     const message = `## 🚨 Human Intervention Required
 
 The automated pipeline fix system was unable to resolve the failing checks.
@@ -795,6 +830,7 @@ The automated pipeline fix system was unable to resolve the failing checks.
 ${failedCheck ? `**Failed Check:** ${failedCheck}` : ''}
 ${failedWorkflow ? `**Failed Workflow:** ${failedWorkflow}` : ''}
 **Auto-fix Attempts:** ${attempts?.attempts || 0}/3
+${learningIssueUrl ? `\n**Tracking Issue:** ${learningIssueUrl}` : ''}
 
 **Available commands:**
 - \`/autofix\` - Retry auto-fix (resets attempt counter)
@@ -802,7 +838,8 @@ ${failedWorkflow ? `**Failed Workflow:** ${failedWorkflow}` : ''}
 
 Please review the failure logs and make the necessary fixes manually.`;
 
-    await this.postComment(owner, repo, prNumber, message);
+    // Use upsert to avoid comment spam
+    await this.upsertComment(owner, repo, prNumber, message, PipelineAutomation.COMMENT_MARKERS.INTERVENTION);
     
     // Add a label to indicate human intervention needed
     try {
@@ -820,7 +857,465 @@ Please review the failure logs and make the necessary fixes manually.`;
   }
 
   /**
-   * Post a comment on a PR
+   * Comment marker types for upsert operations (matching pipeline-monitor.ts)
+   */
+  private static readonly COMMENT_MARKERS = {
+    PIPELINE_ANALYSIS: '<!-- XORNG-PIPELINE-ANALYSIS -->',
+    AUTO_FIX: '<!-- XORNG-AUTO-FIX -->',
+    MERGE_REQUEST: '<!-- XORNG-MERGE-REQUEST -->',
+    MERGE_READY: '<!-- XORNG-MERGE-READY -->',
+    INTERVENTION: '<!-- XORNG-INTERVENTION -->',
+    QUEUE_STATUS: '<!-- XORNG-QUEUE-STATUS -->',
+  } as const;
+
+  /**
+   * Create a learning issue to track fix failures for future improvement
+   * Learning-first workflow: Issues are created to track problems, then PRs reference them
+   * 
+   * Enhanced with cross-repository root cause analysis:
+   * - Analyzes if the issue originates from another repository (e.g., knowledge-best-practices)
+   * - Creates issues in the appropriate target repository
+   * - Links issues across repositories for tracking
+   */
+  private async createLearningIssue(params: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    reason: string;
+    failedCheck?: string;
+    failedWorkflow?: string;
+  }): Promise<string | null> {
+    const { owner, repo, prNumber, reason, failedCheck, failedWorkflow } = params;
+    
+    try {
+      // Check if a learning issue already exists for this PR
+      const existingIssue = await this.findLearningIssueForPR(owner, repo, prNumber);
+      if (existingIssue) {
+        // Update the existing issue with new failure info
+        await this.updateLearningIssue(owner, repo, existingIssue, {
+          failedCheck,
+          failedWorkflow,
+          reason,
+        });
+        return existingIssue.html_url;
+      }
+
+      // Analyze root cause to determine if issue is cross-repository
+      const rootCauseAnalysis = await this.analyzeRootCause({
+        owner,
+        repo,
+        prNumber,
+        reason,
+        failedCheck,
+        failedWorkflow,
+      });
+
+      // Determine target repository for the learning issue
+      let targetOwner = owner;
+      let targetRepo = repo;
+      let isCrossRepo = false;
+
+      if (rootCauseAnalysis && !rootCauseAnalysis.isLocalIssue && rootCauseAnalysis.targetRepository) {
+        targetOwner = rootCauseAnalysis.targetRepository.owner;
+        targetRepo = rootCauseAnalysis.targetRepository.repo;
+        isCrossRepo = true;
+        
+        this.logger.info({
+          sourceRepo: `${owner}/${repo}`,
+          targetRepo: `${targetOwner}/${targetRepo}`,
+          issueType: rootCauseAnalysis.crossRepoIssueType,
+        }, 'Detected cross-repository root cause');
+      }
+
+      // Build issue body with cross-repo context
+      const issueBody = this.buildLearningIssueBody({
+        owner,
+        repo,
+        prNumber,
+        reason,
+        failedCheck,
+        failedWorkflow,
+        isCrossRepo,
+        targetOwner,
+        targetRepo,
+        rootCauseAnalysis,
+      });
+
+      // Create learning issue in target repository
+      const { data: issue } = await this.octokit.issues.create({
+        owner: targetOwner,
+        repo: targetRepo,
+        title: isCrossRepo
+          ? `[Learning][Cross-Repo] Fix needed for ${owner}/${repo}#${prNumber}`
+          : `[Learning] Auto-fix failure analysis for PR #${prNumber}`,
+        body: issueBody,
+        labels: isCrossRepo 
+          ? ['learning', 'automation-feedback', 'cross-repo', rootCauseAnalysis?.crossRepoIssueType || 'investigation']
+          : ['learning', 'automation-feedback'],
+      });
+
+      this.logger.info({
+        targetOwner,
+        targetRepo,
+        prNumber,
+        issueNumber: issue.number,
+        isCrossRepo,
+      }, 'Created learning issue for fix failure');
+
+      // If cross-repo, also add a reference comment on the original PR
+      if (isCrossRepo) {
+        await this.upsertComment(owner, repo, prNumber,
+          `## 🔗 Cross-Repository Issue Identified
+
+The root cause of this failure appears to be in **${targetOwner}/${targetRepo}**.
+
+**Analysis:** ${rootCauseAnalysis?.explanation || 'Further investigation needed'}
+**Tracking Issue:** ${issue.html_url}
+
+The fix should be applied to ${targetOwner}/${targetRepo}, not this repository.`,
+          PipelineAutomation.COMMENT_MARKERS.INTERVENTION
+        );
+      }
+
+      // Emit event for learning service
+      this.emit('learning:issue-created', {
+        owner: targetOwner,
+        repo: targetRepo,
+        prNumber,
+        issueNumber: issue.number,
+        reason,
+        failedCheck,
+        failedWorkflow,
+        isCrossRepo,
+        sourceRepo: isCrossRepo ? { owner, repo } : undefined,
+      });
+
+      return issue.html_url;
+    } catch (error) {
+      this.logger.warn({ error, owner, repo, prNumber }, 'Failed to create learning issue');
+      return null;
+    }
+  }
+
+  /**
+   * Analyze root cause to determine if issue is in another repository
+   * Uses AI to identify cross-repo issues like bad recommendations in knowledge bases
+   */
+  private async analyzeRootCause(params: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    reason: string;
+    failedCheck?: string;
+    failedWorkflow?: string;
+  }): Promise<RootCauseAnalysis | null> {
+    if (!this.aiService.isEnabled()) {
+      return null;
+    }
+
+    const { owner, repo, prNumber, reason, failedCheck, failedWorkflow } = params;
+
+    try {
+      // Build context about the XORNG ecosystem for AI analysis
+      const ecosystemContext = `
+XORNG Ecosystem Repositories:
+- knowledge-best-practices: Contains best practice recommendations and coding guidelines
+- knowledge-documentation: Documentation sources and templates
+- validator-security: Security validation rules and checks
+- validator-code-review: Code review validation rules
+- core: Core functionality and learning service
+- automation: CI/CD automation and pipeline monitoring
+- template-*: Template repositories for creating new components
+- node: Node management and model registry
+
+Cross-Repository Issue Types:
+- knowledge-correction: Wrong or outdated recommendation in knowledge-* repos
+- template-update: Template needs updating based on learned patterns
+- dependency-fix: Issue in a shared dependency
+- config-change: Configuration needs updating in another repo
+`;
+
+      const prompt = `Analyze this pipeline failure and determine if the root cause is in the current repository or another repository.
+
+**Current Repository:** ${owner}/${repo}
+**PR Number:** #${prNumber}
+**Failure Reason:** ${reason}
+${failedCheck ? `**Failed Check:** ${failedCheck}` : ''}
+${failedWorkflow ? `**Failed Workflow:** ${failedWorkflow}` : ''}
+
+${ecosystemContext}
+
+Respond with JSON:
+{
+  "isLocalIssue": true/false,
+  "targetRepository": { "owner": "string", "repo": "string" } | null,
+  "crossRepoIssueType": "knowledge-correction" | "template-update" | "dependency-fix" | "config-change" | null,
+  "explanation": "Detailed explanation of the root cause",
+  "suggestedFix": "Description of how to fix the issue",
+  "confidence": 0.0-1.0
+}
+
+Examples of cross-repo issues:
+- If the failure mentions "following best practice X" but X is wrong → knowledge-correction in knowledge-best-practices
+- If the failure is due to an outdated template pattern → template-update in template-*
+- If a validator is too strict or has bugs → dependency-fix in validator-*
+
+Be conservative: only identify cross-repo issues when you're confident (>0.7).`;
+
+      const response = await this.aiService.chatCompletion([
+        {
+          role: 'system',
+          content: 'You are an expert at analyzing CI/CD failures and identifying root causes across a monorepo ecosystem. Respond only with valid JSON.',
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ], {
+        maxTokens: 1000,
+        temperature: 0.3,
+      });
+
+      const jsonMatch = response.content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        return null;
+      }
+
+      const analysis: RootCauseAnalysis = JSON.parse(jsonMatch[0]);
+      
+      // Only accept cross-repo analysis if confidence is high enough
+      if (!analysis.isLocalIssue && analysis.confidence < 0.7) {
+        this.logger.debug({
+          analysis,
+        }, 'Cross-repo analysis confidence too low, treating as local issue');
+        return { ...analysis, isLocalIssue: true, targetRepository: undefined };
+      }
+
+      return analysis;
+    } catch (error) {
+      this.logger.warn({ error }, 'Failed to analyze root cause');
+      return null;
+    }
+  }
+
+  /**
+   * Build learning issue body with cross-repo context
+   */
+  private buildLearningIssueBody(params: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    reason: string;
+    failedCheck?: string;
+    failedWorkflow?: string;
+    isCrossRepo: boolean;
+    targetOwner: string;
+    targetRepo: string;
+    rootCauseAnalysis: RootCauseAnalysis | null;
+  }): string {
+    const { owner, repo, prNumber, reason, failedCheck, failedWorkflow, isCrossRepo, rootCauseAnalysis } = params;
+
+    if (isCrossRepo && rootCauseAnalysis) {
+      return `## 🧠 Cross-Repository Learning Opportunity
+
+This issue tracks a fix needed in this repository due to a failure in another repository.
+
+### Source Context
+- **Affected Repository:** ${owner}/${repo}
+- **Related PR:** ${owner}/${repo}#${prNumber}
+- **Failure Reason:** ${reason}
+${failedCheck ? `- **Failed Check:** ${failedCheck}` : ''}
+${failedWorkflow ? `- **Failed Workflow:** ${failedWorkflow}` : ''}
+- **Created:** ${new Date().toISOString()}
+
+### Root Cause Analysis
+**Issue Type:** ${rootCauseAnalysis.crossRepoIssueType}
+**Confidence:** ${Math.round(rootCauseAnalysis.confidence * 100)}%
+
+${rootCauseAnalysis.explanation}
+
+### Suggested Fix
+${rootCauseAnalysis.suggestedFix || 'Further investigation needed.'}
+
+### Actions
+- [ ] Review the root cause analysis
+- [ ] Implement the fix in this repository
+- [ ] Verify fix resolves the issue in ${owner}/${repo}#${prNumber}
+- [ ] Update knowledge base with this pattern
+
+### Impact
+Fixing this issue will improve automation for the ${owner}/${repo} repository and potentially other repositories using the same patterns.
+
+---
+*This issue was automatically created by the XORNG Pipeline Automation system.*
+*It tracks a cross-repository dependency where a fix here will resolve issues elsewhere.*
+
+<!-- XORNG-LEARNING-ISSUE -->
+<!-- CROSS_REPO: true -->
+<!-- SOURCE_REPO: ${owner}/${repo} -->
+<!-- SOURCE_PR: ${prNumber} -->`;
+    }
+
+    // Standard local learning issue
+    return `## 🧠 Learning Opportunity
+
+This issue tracks an auto-fix failure to improve future fix suggestions.
+
+### Context
+- **Related PR:** #${prNumber}
+- **Failure Reason:** ${reason}
+${failedCheck ? `- **Failed Check:** ${failedCheck}` : ''}
+${failedWorkflow ? `- **Failed Workflow:** ${failedWorkflow}` : ''}
+- **Created:** ${new Date().toISOString()}
+
+### What Happened
+The automation system attempted to fix pipeline failures but was unable to resolve them automatically.
+
+### Learning Goals
+1. Analyze what caused the fix to fail
+2. Determine if the failure pattern can be recognized in the future
+3. Add new fix patterns to the knowledge base
+
+### Actions
+- [ ] Review the failing check logs
+- [ ] Identify the root cause
+- [ ] Document fix patterns for similar issues
+- [ ] Update automation knowledge base
+
+---
+*This issue was automatically created by the XORNG Pipeline Automation system to track learning opportunities.*
+*When the related PR is resolved, please update this issue with learnings.*
+
+<!-- XORNG-LEARNING-ISSUE -->
+<!-- PR_NUMBER: ${prNumber} -->`;
+  }
+
+  /**
+   * Find existing learning issue for a PR
+   */
+  private async findLearningIssueForPR(
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<{ number: number; html_url: string } | null> {
+    try {
+      const { data: issues } = await this.octokit.issues.listForRepo({
+        owner,
+        repo,
+        labels: 'learning',
+        state: 'open',
+        per_page: 100,
+      });
+
+      const learningIssue = issues.find(issue =>
+        issue.body?.includes(`<!-- PR_NUMBER: ${prNumber} -->`)
+      );
+
+      return learningIssue ? { number: learningIssue.number, html_url: learningIssue.html_url } : null;
+    } catch (error) {
+      this.logger.warn({ error, owner, repo, prNumber }, 'Failed to search for learning issue');
+      return null;
+    }
+  }
+
+  /**
+   * Update an existing learning issue with new failure information
+   */
+  private async updateLearningIssue(
+    owner: string,
+    repo: string,
+    issue: { number: number; html_url: string },
+    newInfo: { failedCheck?: string; failedWorkflow?: string; reason: string }
+  ): Promise<void> {
+    try {
+      await this.octokit.issues.createComment({
+        owner,
+        repo,
+        issue_number: issue.number,
+        body: `### New Fix Attempt Failed
+
+- **Timestamp:** ${new Date().toISOString()}
+- **Reason:** ${newInfo.reason}
+${newInfo.failedCheck ? `- **Failed Check:** ${newInfo.failedCheck}` : ''}
+${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : ''}
+
+*The automation system attempted to fix the related PR again but was unable to resolve the issues.*`,
+      });
+    } catch (error) {
+      this.logger.warn({ error, owner, repo, issueNumber: issue.number }, 'Failed to update learning issue');
+    }
+  }
+
+  /**
+   * Find an existing comment by marker
+   */
+  private async findCommentByMarker(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    marker: string
+  ): Promise<number | null> {
+    try {
+      const { data: comments } = await this.octokit.issues.listComments({
+        owner,
+        repo,
+        issue_number: prNumber,
+        per_page: 100,
+      });
+
+      const existingComment = comments.find(comment =>
+        comment.body?.includes(marker)
+      );
+
+      return existingComment?.id ?? null;
+    } catch (error) {
+      this.logger.warn({ error, owner, repo, prNumber, marker }, 'Failed to list comments for marker search');
+      return null;
+    }
+  }
+
+  /**
+   * Create or update a comment (upsert pattern)
+   * Best practice: Use markers to identify bot comments and update them instead of creating spam
+   */
+  private async upsertComment(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    body: string,
+    marker: string
+  ): Promise<void> {
+    const timestamp = new Date().toISOString();
+    const bodyWithMarker = `${marker}\n${body}\n\n<sub>Last updated: ${timestamp}</sub>`;
+
+    try {
+      const existingCommentId = await this.findCommentByMarker(owner, repo, prNumber, marker);
+
+      if (existingCommentId) {
+        await this.octokit.issues.updateComment({
+          owner,
+          repo,
+          comment_id: existingCommentId,
+          body: bodyWithMarker,
+        });
+        this.logger.debug({ owner, repo, prNumber, marker }, 'Updated existing comment');
+      } else {
+        await this.octokit.issues.createComment({
+          owner,
+          repo,
+          issue_number: prNumber,
+          body: bodyWithMarker,
+        });
+        this.logger.debug({ owner, repo, prNumber, marker }, 'Created new comment');
+      }
+    } catch (error) {
+      this.logger.error({ error, owner, repo, prNumber, marker }, 'Failed to upsert comment');
+    }
+  }
+
+  /**
+   * Post a comment on a PR (creates a new comment)
+   * Use upsertComment for bot status updates to avoid comment spam
    */
   private async postComment(owner: string, repo: string, prNumber: number, body: string): Promise<void> {
     try {
@@ -1028,8 +1523,9 @@ Please review the failure logs and make the necessary fixes manually.`;
     lock.lockedAt = new Date();
     
     // Notify the PR that it's now being processed
-    await this.postComment(owner, repo, next.prNumber,
-      `🔄 Your PR is now being processed for auto-fix. It was queued at ${next.queuedAt.toISOString()}.`
+    await this.upsertComment(owner, repo, next.prNumber,
+      `🔄 Your PR is now being processed for auto-fix. It was queued at ${next.queuedAt.toISOString()}.`,
+      PipelineAutomation.COMMENT_MARKERS.QUEUE_STATUS
     );
     
     // Trigger pipeline check for this PR
@@ -1041,8 +1537,9 @@ Please review the failure logs and make the necessary fixes manually.`;
       } else {
         // PR might have been fixed manually or checks now pass
         this.releaseRepoLock(repo, next.prNumber);
-        await this.postComment(owner, repo, next.prNumber,
-          `✅ Pipeline checks are now passing! No auto-fix needed.`
+        await this.upsertComment(owner, repo, next.prNumber,
+          `✅ Pipeline checks are now passing! No auto-fix needed.`,
+          PipelineAutomation.COMMENT_MARKERS.AUTO_FIX
         );
         // Process next in queue
         this.processNextQueuedPR(owner, repo);
@@ -1056,6 +1553,7 @@ Please review the failure logs and make the necessary fixes manually.`;
 
   /**
    * Notify a PR that it has been queued
+   * Uses upsert pattern to avoid spam
    */
   private async notifyPRQueued(params: {
     owner: string;
@@ -1082,7 +1580,7 @@ You can also:
 
 _This ensures clean git history and prevents conflicting automated changes._`;
 
-    await this.postComment(owner, repo, prNumber, message);
+    await this.upsertComment(owner, repo, prNumber, message, PipelineAutomation.COMMENT_MARKERS.QUEUE_STATUS);
   }
 
   /**
@@ -1190,6 +1688,193 @@ _This ensures clean git history and prevents conflicting automated changes._`;
       this.releaseRepoLock(repo, prNumber);
       this.processNextQueuedPR(owner, repo);
       throw error;
+    }
+  }
+
+  // ==========================================================================
+  // Repository Creation from Learnings
+  // ==========================================================================
+
+  /**
+   * Create a new repository based on learned patterns
+   * 
+   * This method allows the automation to create new repositories when learnings
+   * suggest a new component, validator, or knowledge source is needed.
+   * 
+   * Uses GitHub's template repository feature for consistent structure.
+   * 
+   * @param params Configuration for the new repository
+   * @returns URL of the created repository or null if failed
+   */
+  async createRepositoryFromLearning(params: {
+    /** Name for the new repository */
+    name: string;
+    /** Description of the repository */
+    description: string;
+    /** Template repository to use (e.g., template-validator, template-knowledge) */
+    templateRepo: 'template-base' | 'template-knowledge' | 'template-task' | 'template-validator';
+    /** Organization to create the repo in (defaults to config organization) */
+    organization?: string;
+    /** Whether the repository should be private */
+    isPrivate?: boolean;
+    /** Learning issue that triggered this creation */
+    learningIssue?: {
+      owner: string;
+      repo: string;
+      number: number;
+    };
+    /** Initial configuration or customization for the new repo */
+    customization?: {
+      /** Files to create or modify after cloning */
+      files?: Array<{
+        path: string;
+        content: string;
+      }>;
+      /** Topics/tags to add */
+      topics?: string[];
+    };
+  }): Promise<string | null> {
+    const {
+      name,
+      description,
+      templateRepo,
+      organization,
+      isPrivate = false,
+      learningIssue,
+      customization,
+    } = params;
+
+    try {
+      // Get organization from config if not specified
+      const targetOrg = organization || this.pipelineMonitor['config'].organization;
+      
+      this.logger.info({
+        name,
+        templateRepo,
+        targetOrg,
+        hasLearningIssue: !!learningIssue,
+      }, 'Creating new repository from learning');
+
+      // Step 1: Create repository from template
+      const { data: newRepo } = await this.octokit.repos.createUsingTemplate({
+        template_owner: targetOrg,
+        template_repo: templateRepo,
+        owner: targetOrg,
+        name,
+        description,
+        private: isPrivate,
+        include_all_branches: false,
+      });
+
+      this.logger.info({
+        repoUrl: newRepo.html_url,
+        name: newRepo.name,
+      }, 'Repository created from template');
+
+      // Step 2: Apply customizations if any
+      if (customization?.files && customization.files.length > 0) {
+        // Wait a moment for repo to be ready
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        for (const file of customization.files) {
+          try {
+            await this.octokit.repos.createOrUpdateFileContents({
+              owner: targetOrg,
+              repo: name,
+              path: file.path,
+              message: `chore: Initialize ${file.path} from learning`,
+              content: Buffer.from(file.content).toString('base64'),
+            });
+          } catch (error) {
+            this.logger.warn({ error, file: file.path }, 'Failed to create customization file');
+          }
+        }
+      }
+
+      // Step 3: Add topics if specified
+      if (customization?.topics && customization.topics.length > 0) {
+        try {
+          await this.octokit.repos.replaceAllTopics({
+            owner: targetOrg,
+            repo: name,
+            names: ['xorng', 'automation', ...customization.topics],
+          });
+        } catch (error) {
+          this.logger.warn({ error }, 'Failed to set repository topics');
+        }
+      }
+
+      // Step 4: If triggered by learning issue, update the issue
+      if (learningIssue) {
+        await this.octokit.issues.createComment({
+          owner: learningIssue.owner,
+          repo: learningIssue.repo,
+          issue_number: learningIssue.number,
+          body: `## 🚀 New Repository Created
+
+A new repository has been created based on this learning:
+
+**Repository:** [${targetOrg}/${name}](${newRepo.html_url})
+**Template:** ${templateRepo}
+**Description:** ${description}
+
+### Next Steps
+- [ ] Review the generated repository structure
+- [ ] Customize implementation based on learning goals
+- [ ] Add tests and documentation
+- [ ] Set up CI/CD pipeline
+- [ ] Create initial PR with implementation
+
+---
+*Repository automatically created by XORNG Learning System*`,
+        });
+
+        // Also update issue labels
+        try {
+          await this.octokit.issues.addLabels({
+            owner: learningIssue.owner,
+            repo: learningIssue.repo,
+            issue_number: learningIssue.number,
+            labels: ['repo-created'],
+          });
+        } catch {
+          // Label may not exist
+        }
+      }
+
+      // Emit event for tracking
+      this.emit('learning:repo-created', {
+        name,
+        url: newRepo.html_url,
+        templateRepo,
+        learningIssue,
+      });
+
+      return newRepo.html_url;
+    } catch (error) {
+      this.logger.error({ error, name, templateRepo }, 'Failed to create repository from learning');
+      
+      // If we have a learning issue, comment about the failure
+      if (learningIssue) {
+        try {
+          await this.octokit.issues.createComment({
+            owner: learningIssue.owner,
+            repo: learningIssue.repo,
+            issue_number: learningIssue.number,
+            body: `## ❌ Repository Creation Failed
+
+Failed to create repository **${name}** from template **${templateRepo}**.
+
+**Error:** ${error instanceof Error ? error.message : 'Unknown error'}
+
+Please create the repository manually.`,
+          });
+        } catch {
+          // Ignore comment failure
+        }
+      }
+      
+      return null;
     }
   }
 
