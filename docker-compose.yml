@@ -12,7 +12,7 @@ services:
     command:
       # API and Dashboard (for debugging)
       - "--api.insecure=true"
-      - "--log.level=INFO"
+      - "--log.level=DEBUG"
       # Docker provider - direct socket mount (no proxy needed for v2.x)
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
