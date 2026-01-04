@@ -1,18 +1,20 @@
-# XORNG Automation Server
-# Multi-stage build for minimal production image
-
-# Stage 1: Build
-FROM node:20-alpine AS builder
-
+FROM node:18-alpine AS builder
 WORKDIR /app
-
-# Copy package files
 COPY package*.json ./
-COPY tsconfig.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
 
-# Install dependencies
-RUN npm ci
+FROM node:18-alpine AS runtime
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package*.json ./
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+USER appuser
 
+# Your existing commands here (if any)
+# CMD ["your-command"]
 # Copy source
 COPY src/ ./src/
 
