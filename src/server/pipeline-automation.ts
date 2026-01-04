@@ -243,7 +243,28 @@ export class PipelineAutomation extends EventEmitter {
     this.pipelineMonitor.on('fix:failed', (data) => {
       this.stats.fixesAttempted++;
       this.recordFixAttempt(data.repo, data.prNumber, false, data.error);
+      // Release lock and process next queued PR when fix fails
+      this.releaseRepoLock(data.repo, data.prNumber);
+      this.processNextQueuedPR(data.owner, data.repo);
       this.emit('fix:failed', data);
+    });
+    
+    // Handle analysis completion (regardless of whether fix was attempted)
+    // This is emitted when:
+    // 1. No auto-fixable issues are found
+    // 2. Validator pre-check fails
+    // 3. Auto-fix is disabled
+    this.pipelineMonitor.on('analysis:complete', (data) => {
+      this.logger.info({
+        owner: data.owner,
+        repo: data.repo,
+        prNumber: data.prNumber,
+        fixAttempted: data.fixAttempted,
+      }, 'Analysis complete, releasing lock');
+      
+      // Release lock and process next queued PR
+      this.releaseRepoLock(data.repo, data.prNumber);
+      this.processNextQueuedPR(data.owner, data.repo);
     });
     
     // Handle fix success (pipeline passed after fix)
@@ -289,6 +310,10 @@ export class PipelineAutomation extends EventEmitter {
       
       // Clean up stored analyses
       this.appliedAnalyses.delete(prKey);
+      
+      // Release lock and process next queued PR after successful fix
+      this.releaseRepoLock(data.repo, data.prNumber);
+      this.processNextQueuedPR(data.owner, data.repo);
       
       this.emit('fix:successful', data);
     });
@@ -420,6 +445,7 @@ export class PipelineAutomation extends EventEmitter {
         this.logger.error({ error, owner: context.owner, repo: context.repo, prNumber: pr.number }, 'Failed to process check run');
         // Release lock on error so other PRs can be processed
         this.releaseRepoLock(context.repo, pr.number);
+        this.processNextQueuedPR(context.owner, context.repo);
       }
     }
   }
@@ -1133,6 +1159,7 @@ _This ensures clean git history and prevents conflicting automated changes._`;
           prNumber,
         }, 'No failed checks found during scanner analysis - PR may have been fixed');
         this.releaseRepoLock(repo, prNumber);
+        this.processNextQueuedPR(owner, repo);
         return;
       }
       
@@ -1161,6 +1188,7 @@ _This ensures clean git history and prevents conflicting automated changes._`;
         prNumber,
       }, 'Failed to trigger PR analysis from scanner');
       this.releaseRepoLock(repo, prNumber);
+      this.processNextQueuedPR(owner, repo);
       throw error;
     }
   }

@@ -924,6 +924,9 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
       
       // Post analysis comment
       await this.postFailureAnalysisComment(owner, repo, prNumber, analyses);
+      
+      // Emit event so pipeline-automation can release lock and process queue
+      this.emit('analysis:complete', { owner, repo, prNumber, fixAttempted: false, analyses });
       return;
     }
 
@@ -966,6 +969,9 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
               validatorIssues.map(i => `- ${i}`).join('\n') +
               `\n\n**Human intervention required.**`
             );
+            
+            // Emit event so pipeline-automation can release lock and process queue
+            this.emit('analysis:complete', { owner, repo, prNumber, fixAttempted: false, validationFailed: true });
             return;
           }
           
@@ -1021,6 +1027,9 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
     } else {
       // Just post the analysis
       await this.postFailureAnalysisComment(owner, repo, prNumber, analyses);
+      
+      // Emit event so pipeline-automation can release lock and process queue
+      this.emit('analysis:complete', { owner, repo, prNumber, fixAttempted: false, autoFixDisabled: true, analyses });
     }
 
     this.emit('pipeline:failure-processed', { owner, repo, prNumber, analyses });
