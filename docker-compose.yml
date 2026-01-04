@@ -1,10 +1,84 @@
 services:
+  # ===========================================
+  # Traefik Reverse Proxy (automatic HTTPS)
+  # Only used when AUTOMATION_DOMAIN is set
+  # ===========================================
+  traefik:
+    image: traefik:v3.2
+    container_name: traefik
+    restart: unless-stopped
+    profiles:
+      - with-domain  # Only starts when profile is active
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=xorng-network"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@${AUTOMATION_DOMAIN}}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--log.level=${LOG_LEVEL:-INFO}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - xorng-network
+
+  # ===========================================
+  # XORNG Automation Server (Webhook + Feedback API)
+  # ===========================================
+  automation-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${AUTOMATION_IMAGE:-ghcr.io/xorng/xorng-automation:latest}
+    container_name: xorng-automation
+    restart: unless-stopped
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GH_ORG=${GH_ORG:-XORNG}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - WEBHOOK_URL=${WEBHOOK_URL:-https://${AUTOMATION_DOMAIN}/webhook/github}
+      - PORT=3000
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - xorng-network
+    # Traefik labels (only apply when using with-domain profile)
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.automation.rule=Host(`${AUTOMATION_DOMAIN}`)"
+      - "traefik.http.routers.automation.entrypoints=websecure"
+      - "traefik.http.routers.automation.tls=true"
+      - "traefik.http.routers.automation.tls.certresolver=letsencrypt"
+      - "traefik.http.services.automation.loadbalancer.server.port=3000"
+    # Port mapping only when NOT using Traefik (no profile)
+    ports:
+      - "${AUTOMATION_PORT:-3001}:3000"
+
+  # ===========================================
   # Redis for memory system
+  # ===========================================
   redis:
     image: redis:7-alpine
     container_name: xorng-redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes
@@ -16,17 +90,18 @@ services:
     networks:
       - xorng-network
 
+  # ===========================================
   # XORNG Core orchestrator
+  # ===========================================
   xorng-core:
     build:
       context: ../core
       dockerfile: Dockerfile
     container_name: xorng-core
-    ports:
-      - "3000:3000"
+    restart: unless-stopped
     environment:
       - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=info
+      - LOG_LEVEL=${LOG_LEVEL:-info}
       - NODE_ENV=production
     depends_on:
       redis:
@@ -35,31 +110,40 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - xorng-network
+    labels:
+      - "traefik.enable=false"
 
+  # ===========================================
   # Code Review Validator
+  # ===========================================
   validator-code-review:
     build:
       context: ../validator-code-review
       dockerfile: Dockerfile
     container_name: xorng-validator-code-review
+    restart: unless-stopped
     environment:
-      - LOG_LEVEL=info
+      - LOG_LEVEL=${LOG_LEVEL:-info}
     networks:
       - xorng-network
 
+  # ===========================================
   # Security Validator
+  # ===========================================
   validator-security:
     build:
       context: ../validator-security
       dockerfile: Dockerfile
     container_name: xorng-validator-security
+    restart: unless-stopped
     environment:
-      - LOG_LEVEL=info
+      - LOG_LEVEL=${LOG_LEVEL:-info}
     networks:
       - xorng-network
 
 volumes:
   redis-data:
+  letsencrypt:
 
 networks:
   xorng-network:

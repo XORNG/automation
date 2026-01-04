@@ -1,0 +1,29 @@
+# Optional: Caddy reverse proxy configuration
+# Place this in /etc/caddy/Caddyfile on your VServer
+
+# Replace with your domain
+xorng.yourdomain.com {
+    # Automatic HTTPS with Let's Encrypt
+    
+    # Reverse proxy to XORNG Automation Server
+    reverse_proxy localhost:3000
+    
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+    
+    # Access logs
+    log {
+        output file /var/log/caddy/xorng-access.log
+        format json
+    }
+}
+
+# Health check endpoint (no HTTPS required)
+:8080 {
+    respond /health "OK" 200
+}
