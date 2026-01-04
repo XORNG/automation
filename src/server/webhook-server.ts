@@ -28,7 +28,11 @@ export type GitHubEventType =
   | 'repository'
   | 'create'
   | 'delete'
-  | 'ping';
+  | 'ping'
+  | 'check_run'
+  | 'check_suite'
+  | 'workflow_run'
+  | 'workflow_job';
 
 /**
  * GitHub webhook payload
@@ -68,6 +72,7 @@ export interface GitHubWebhookPayload {
     html_url: string;
     created_at: string;
     updated_at: string;
+    pull_request?: unknown;
   };
   pull_request?: {
     id: number;
@@ -97,6 +102,37 @@ export interface GitHubWebhookPayload {
       id: number;
     };
     created_at: string;
+  };
+  check_run?: {
+    id: number;
+    name: string;
+    status: string;
+    conclusion: string | null;
+    pull_requests: Array<{ number: number }>;
+    html_url: string;
+  };
+  check_suite?: {
+    id: number;
+    status: string;
+    conclusion: string | null;
+    pull_requests: Array<{ number: number }>;
+  };
+  workflow_run?: {
+    id: number;
+    name: string;
+    status: string;
+    conclusion: string | null;
+    head_sha: string;
+    head_branch: string;
+    pull_requests: Array<{ number: number }>;
+    html_url: string;
+  };
+  workflow_job?: {
+    id: number;
+    run_id: number;
+    name: string;
+    status: string;
+    conclusion: string | null;
   };
 }
 

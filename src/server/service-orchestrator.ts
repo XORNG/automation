@@ -384,6 +384,28 @@ export class ServiceOrchestrator {
   }
 
   /**
+   * Get discovered services by type
+   * Used by pipeline automation to query knowledge/validator agents
+   */
+  getServicesByType(type: DiscoveredService['type']): DiscoveredService[] {
+    return Array.from(this.discoveredServices.values()).filter(s => s.type === type);
+  }
+
+  /**
+   * Get a specific discovered service by name
+   */
+  getService(name: string): DiscoveredService | undefined {
+    return this.discoveredServices.get(name);
+  }
+
+  /**
+   * Check if any services of a specific type are available
+   */
+  hasServicesOfType(type: DiscoveredService['type']): boolean {
+    return this.getServicesByType(type).length > 0;
+  }
+
+  /**
    * Force redeploy of a specific service
    */
   async redeployService(serviceName: string): Promise<void> {
