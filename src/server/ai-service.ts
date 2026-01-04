@@ -19,6 +19,14 @@ export interface AIServiceConfig {
   httpReferer?: string;
   /** Site name for OpenRouter (optional, for ranking) */
   siteName?: string;
+  /** Max retry attempts for rate-limited or failed requests (default: 3) */
+  maxRetries?: number;
+  /** Initial delay in ms before first retry (default: 5000) */
+  retryDelayMs?: number;
+  /** Maximum delay in ms between retries (default: 120000 = 2 minutes) */
+  maxRetryDelayMs?: number;
+  /** Fallback models to try if primary model fails (OpenRouter feature) */
+  fallbackModels?: string[];
 }
 
 /**
@@ -94,11 +102,20 @@ export interface IssueAnalysisResult {
  */
 export class AIService extends EventEmitter {
   private logger: Logger;
-  private config: AIServiceConfig;
+  private config: Required<Pick<AIServiceConfig, 'apiKey' | 'model' | 'baseUrl' | 'httpReferer' | 'siteName' | 'maxRetries' | 'retryDelayMs' | 'maxRetryDelayMs'>> & AIServiceConfig;
   private enabled: boolean;
 
   // OpenRouter API endpoint
   private static readonly DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+  
+  // Default fallback models (FREE models on OpenRouter - no cost)
+  // These are high-quality open-source models available at $0/token
+  private static readonly DEFAULT_FALLBACK_MODELS = [
+    'xiaomi/mimo-v2-flash:free',          // MiMo-V2 MoE model, #1 on SWE-bench, 256K context
+    'kwaipilot/kat-coder-pro:free',       // KAT-Coder-Pro, optimized for coding tasks
+    'tngtech/deepseek-r1t2-chimera:free', // DeepSeek R1T2 Chimera, strong reasoning
+    'nvidia/nemotron-3-nano-30b-a3b:free', // NVIDIA Nemotron, efficient agentic AI
+  ];
 
   constructor(config: AIServiceConfig) {
     super();
@@ -107,6 +124,10 @@ export class AIService extends EventEmitter {
       baseUrl: config.baseUrl || AIService.DEFAULT_BASE_URL,
       httpReferer: config.httpReferer || 'https://github.com/XORNG',
       siteName: config.siteName || 'XORNG Automation',
+      maxRetries: config.maxRetries ?? 3,
+      retryDelayMs: config.retryDelayMs ?? 5000,
+      maxRetryDelayMs: config.maxRetryDelayMs ?? 120000,
+      fallbackModels: config.fallbackModels ?? AIService.DEFAULT_FALLBACK_MODELS,
     };
     this.enabled = !!config.apiKey;
     this.logger = pino({
@@ -117,7 +138,12 @@ export class AIService extends EventEmitter {
     if (!this.enabled) {
       this.logger.warn('AI service is disabled - OPENROUTER_API_KEY not configured');
     } else {
-      this.logger.info({ model: config.model }, 'AI service initialized with OpenRouter');
+      this.logger.info({ 
+        model: config.model,
+        fallbackModels: this.config.fallbackModels,
+        maxRetries: this.config.maxRetries,
+        retryDelayMs: this.config.retryDelayMs,
+      }, 'AI service initialized with OpenRouter');
     }
   }
 
@@ -136,7 +162,73 @@ export class AIService extends EventEmitter {
   }
 
   /**
-   * Make a chat completion request to OpenRouter
+   * Calculate exponential backoff delay with jitter
+   */
+  private calculateRetryDelay(attempt: number, rateLimitResetMs?: number): number {
+    // If we have a rate limit reset time from the API, use it (with some buffer)
+    if (rateLimitResetMs && rateLimitResetMs > 0) {
+      const waitTime = Math.min(rateLimitResetMs + 1000, this.config.maxRetryDelayMs);
+      return waitTime;
+    }
+    
+    // Exponential backoff: delay * 2^attempt with jitter
+    const baseDelay = this.config.retryDelayMs * Math.pow(2, attempt);
+    const jitter = Math.random() * 1000; // Add up to 1 second of jitter
+    return Math.min(baseDelay + jitter, this.config.maxRetryDelayMs);
+  }
+
+  /**
+   * Extract rate limit reset time from error response
+   */
+  private extractRateLimitReset(errorText: string, headers?: Headers): number | undefined {
+    try {
+      // Try to get from response headers first
+      if (headers) {
+        const resetHeader = headers.get('X-RateLimit-Reset');
+        if (resetHeader) {
+          const resetTime = parseInt(resetHeader, 10);
+          if (!isNaN(resetTime)) {
+            return resetTime - Date.now();
+          }
+        }
+      }
+      
+      // Try to parse from error body
+      const errorJson = JSON.parse(errorText);
+      const resetHeader = errorJson?.error?.metadata?.headers?.['X-RateLimit-Reset'];
+      if (resetHeader) {
+        const resetTime = parseInt(resetHeader, 10);
+        if (!isNaN(resetTime)) {
+          return resetTime - Date.now();
+        }
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+    return undefined;
+  }
+
+  /**
+   * Check if an error is retryable
+   */
+  private isRetryableError(status: number): boolean {
+    // Retry on rate limits (429) and server errors (5xx)
+    return status === 429 || (status >= 500 && status < 600);
+  }
+
+  /**
+   * Sleep for a given number of milliseconds
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Make a chat completion request to OpenRouter with automatic retry and model fallback
+   * 
+   * OpenRouter supports a `models` array parameter for automatic failover when the
+   * primary model fails (provider issues, rate limits, etc.). The first available
+   * model in the array will be used.
    */
   async chatCompletion(
     messages: ChatMessage[],
@@ -144,78 +236,172 @@ export class AIService extends EventEmitter {
       maxTokens?: number;
       temperature?: number;
       model?: string;
+      useFallbackModels?: boolean;
     }
   ): Promise<AICompletionResponse> {
     if (!this.enabled) {
       throw new Error('AI service is disabled - OPENROUTER_API_KEY not configured');
     }
 
-    const model = options?.model || this.config.model;
+    const primaryModel = options?.model || this.config.model;
+    const useFallback = options?.useFallbackModels ?? true;
     const url = `${this.config.baseUrl}/chat/completions`;
 
-    this.logger.debug({ model, messageCount: messages.length }, 'Making chat completion request');
+    // Build models array for OpenRouter automatic failover
+    // When models array is provided, OpenRouter tries each in order until one succeeds
+    const modelsArray = useFallback && this.config.fallbackModels?.length
+      ? [primaryModel, ...this.config.fallbackModels.filter(m => m !== primaryModel)]
+      : undefined;
 
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.config.apiKey}`,
-          'HTTP-Referer': this.config.httpReferer!,
-          'X-Title': this.config.siteName!,
-        },
-        body: JSON.stringify({
-          model,
+    this.logger.debug({ 
+      primaryModel, 
+      modelsArray: modelsArray || [primaryModel],
+      messageCount: messages.length,
+    }, 'Making chat completion request');
+
+    let lastError: Error | null = null;
+    
+    for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
+      try {
+        // Build request body - use 'models' array for fallback, or 'model' for single model
+        const requestBody: Record<string, unknown> = {
           messages,
           max_tokens: options?.maxTokens || 4096,
           temperature: options?.temperature || 0.7,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        this.logger.error({ status: response.status, error: errorText }, 'OpenRouter API error');
-        throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
-      }
-
-      const data = await response.json() as {
-        id: string;
-        model: string;
-        choices: Array<{
-          message?: { content?: string };
-          finish_reason?: string;
-        }>;
-        usage?: {
-          prompt_tokens?: number;
-          completion_tokens?: number;
-          total_tokens?: number;
+          // Route setting to improve reliability - allows OpenRouter to route around degraded providers
+          route: 'fallback',
         };
-      };
 
-      const result: AICompletionResponse = {
-        id: data.id,
-        content: data.choices[0]?.message?.content || '',
-        model: data.model,
-        usage: {
-          promptTokens: data.usage?.prompt_tokens || 0,
-          completionTokens: data.usage?.completion_tokens || 0,
-          totalTokens: data.usage?.total_tokens || 0,
-        },
-        finishReason: data.choices[0]?.finish_reason || 'unknown',
-      };
+        if (modelsArray && modelsArray.length > 1) {
+          requestBody.models = modelsArray;
+        } else {
+          requestBody.model = primaryModel;
+        }
 
-      this.logger.debug({
-        id: result.id,
-        model: result.model,
-        tokens: result.usage.totalTokens,
-      }, 'Chat completion successful');
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.config.apiKey}`,
+            'HTTP-Referer': this.config.httpReferer!,
+            'X-Title': this.config.siteName!,
+          },
+          body: JSON.stringify(requestBody),
+        });
 
-      this.emit('completion', result);
-      return result;
-    } catch (error) {
-      this.logger.error({ error }, 'Chat completion failed');
-      throw error;
+        if (!response.ok) {
+          const errorText = await response.text();
+          
+          // Check if this is a retryable error
+          if (this.isRetryableError(response.status) && attempt < this.config.maxRetries) {
+            const rateLimitResetMs = this.extractRateLimitReset(errorText, response.headers);
+            const delayMs = this.calculateRetryDelay(attempt, rateLimitResetMs);
+            
+            this.logger.warn({
+              status: response.status,
+              attempt: attempt + 1,
+              maxRetries: this.config.maxRetries,
+              retryInMs: delayMs,
+              rateLimitResetMs,
+            }, `Retryable API error, waiting ${Math.round(delayMs / 1000)}s before retry`);
+            
+            this.emit('retry', { 
+              attempt: attempt + 1, 
+              status: response.status, 
+              delayMs,
+              error: errorText,
+            });
+            
+            await this.sleep(delayMs);
+            continue;
+          }
+          
+          this.logger.error({ status: response.status, error: errorText }, 'OpenRouter API error');
+          throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+        }
+
+        const data = await response.json() as {
+          id: string;
+          model: string;
+          choices: Array<{
+            message?: { content?: string };
+            finish_reason?: string;
+          }>;
+          usage?: {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            total_tokens?: number;
+          };
+        };
+
+        const result: AICompletionResponse = {
+          id: data.id,
+          content: data.choices[0]?.message?.content || '',
+          model: data.model,
+          usage: {
+            promptTokens: data.usage?.prompt_tokens || 0,
+            completionTokens: data.usage?.completion_tokens || 0,
+            totalTokens: data.usage?.total_tokens || 0,
+          },
+          finishReason: data.choices[0]?.finish_reason || 'unknown',
+        };
+
+        // Log success, noting if fallback was used
+        const usedFallback = modelsArray && data.model !== primaryModel;
+        if (attempt > 0 || usedFallback) {
+          this.logger.info({
+            id: result.id,
+            requestedModel: primaryModel,
+            actualModel: result.model,
+            usedFallback,
+            tokens: result.usage.totalTokens,
+            retriesNeeded: attempt,
+          }, usedFallback 
+            ? `Chat completion successful using fallback model ${result.model}` 
+            : 'Chat completion successful after retries');
+        } else {
+          this.logger.debug({
+            id: result.id,
+            model: result.model,
+            tokens: result.usage.totalTokens,
+          }, 'Chat completion successful');
+        }
+
+        this.emit('completion', result);
+        return result;
+      } catch (error) {
+        lastError = error as Error;
+        
+        // Check if this is a network error that we should retry
+        if (attempt < this.config.maxRetries && 
+            (error instanceof TypeError || // Network errors
+             (error as Error).message?.includes('fetch'))) {
+          const delayMs = this.calculateRetryDelay(attempt);
+          
+          this.logger.warn({
+            error: (error as Error).message,
+            attempt: attempt + 1,
+            maxRetries: this.config.maxRetries,
+            retryInMs: delayMs,
+          }, `Network error, waiting ${Math.round(delayMs / 1000)}s before retry`);
+          
+          this.emit('retry', { 
+            attempt: attempt + 1, 
+            error: (error as Error).message, 
+            delayMs,
+          });
+          
+          await this.sleep(delayMs);
+          continue;
+        }
+        
+        this.logger.error({ error }, 'Chat completion failed');
+        throw error;
+      }
     }
+    
+    // Should not reach here, but just in case
+    throw lastError || new Error('Chat completion failed after all retries');
   }
 
   /**
@@ -460,11 +646,29 @@ ${request.existingCode ? `Existing Code:\n\`\`\`${request.language}\n${request.e
 
 /**
  * Create an AI service instance from environment variables
+ * 
+ * Environment variables:
+ * - OPENROUTER_API_KEY: API key for OpenRouter (required)
+ * - OPENROUTER_MODEL: Primary model to use (default: anthropic/claude-sonnet-4)
+ * - AI_FALLBACK_MODELS: Comma-separated list of fallback models (optional)
+ * - AI_MAX_RETRIES: Maximum retry attempts (default: 3)
+ * - AI_RETRY_DELAY_MS: Initial retry delay in ms (default: 5000)
+ * - AI_MAX_RETRY_DELAY_MS: Maximum retry delay in ms (default: 120000)
  */
 export function createAIServiceFromEnv(options?: { logLevel?: string }): AIService {
+  // Parse fallback models from comma-separated string
+  const fallbackModelsEnv = process.env.AI_FALLBACK_MODELS;
+  const fallbackModels = fallbackModelsEnv
+    ? fallbackModelsEnv.split(',').map(m => m.trim()).filter(m => m.length > 0)
+    : undefined;
+
   return new AIService({
     apiKey: process.env.OPENROUTER_API_KEY || '',
-    model: process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4',
+    model: process.env.OPENROUTER_MODEL || 'mistralai/devstral-2512:free',
     logLevel: options?.logLevel || process.env.LOG_LEVEL || 'info',
+    maxRetries: process.env.AI_MAX_RETRIES ? parseInt(process.env.AI_MAX_RETRIES, 10) : undefined,
+    retryDelayMs: process.env.AI_RETRY_DELAY_MS ? parseInt(process.env.AI_RETRY_DELAY_MS, 10) : undefined,
+    maxRetryDelayMs: process.env.AI_MAX_RETRY_DELAY_MS ? parseInt(process.env.AI_MAX_RETRY_DELAY_MS, 10) : undefined,
+    fallbackModels,
   });
 }
