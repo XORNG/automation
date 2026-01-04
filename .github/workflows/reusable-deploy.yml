@@ -36,7 +36,8 @@ on:
         required: true
       vserver_port:
         required: false
-      github_token:
+      gh_automation_token:
+        description: 'GitHub token for automation (cannot use github_token - reserved)'
         required: true
       webhook_secret:
         required: false
@@ -75,7 +76,7 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           AUTOMATION_IMAGE: ${{ inputs.image_tag }}
-          GITHUB_TOKEN: ${{ secrets.github_token }}
+          GITHUB_TOKEN: ${{ secrets.gh_automation_token }}
           WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
           GH_ORG: ${{ secrets.gh_org || 'XORNG' }}
           OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
