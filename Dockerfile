@@ -24,6 +24,9 @@ FROM node:20-alpine AS production
 
 WORKDIR /app
 
+# Install wget for healthcheck (not included in Alpine by default)
+RUN apk add --no-cache wget
+
 # Create non-root user
 RUN addgroup -g 1001 -S xorng && \
     adduser -S xorng -u 1001 -G xorng
@@ -44,9 +47,10 @@ USER xorng
 # Expose port
 EXPOSE 3000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+# Health check using node (guaranteed available, no extra install needed)
+# Note: wget is now installed but using node for consistency
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 # Environment variables
 ENV NODE_ENV=production
