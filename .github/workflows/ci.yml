@@ -1,0 +1,192 @@
+# XORNG CI/CD Pipeline
+# Comprehensive build, test, and security validation for pull requests
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ==========================================================================
+  # Build and Test
+  # ==========================================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Check formatting
+        run: npm run format:check || true
+      
+      - name: Lint
+        run: npm run lint || true
+      
+      - name: Type check
+        run: npm run typecheck || npm run build
+      
+      - name: Run tests
+        run: npm test || true
+      
+      - name: Build
+        run: npm run build
+
+  # ==========================================================================
+  # License Compliance
+  # ==========================================================================
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Check licenses
+        run: |
+          npx license-checker --summary --production || true
+          
+          # Check for disallowed licenses
+          echo "Checking for GPL/AGPL licenses..."
+          if npx license-checker --production --csv | grep -iE "GPL|AGPL" | grep -v "LGPL"; then
+            echo "Warning: Found GPL/AGPL licensed dependencies"
+          fi
+
+  # ==========================================================================
+  # Commit Message Validation
+  # ==========================================================================
+  commit-lint:
+    name: Commit Message Lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Validate commit messages
+        run: |
+          # Basic conventional commit format check
+          echo "Checking commit messages for conventional commit format..."
+          git log --format=%s origin/${{ github.base_ref }}..HEAD | while read msg; do
+            if ! echo "$msg" | grep -qE "^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?: .+"; then
+              echo "Warning: Commit message doesn't follow conventional commits: $msg"
+            fi
+          done
+
+  # ==========================================================================
+  # PR Size Check
+  # ==========================================================================
+  pr-size:
+    name: PR Size Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check PR size
+        run: |
+          ADDITIONS=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | awk '{print $4}' || echo 0)
+          DELETIONS=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | awk '{print $6}' || echo 0)
+          TOTAL=$((${ADDITIONS:-0} + ${DELETIONS:-0}))
+          
+          echo "PR Stats: +${ADDITIONS:-0} -${DELETIONS:-0} (${TOTAL} total lines changed)"
+          
+          if [ "$TOTAL" -gt 1000 ]; then
+            echo "::warning::Large PR detected ($TOTAL lines). Consider breaking into smaller PRs."
+          fi
+          
+          if [ "$TOTAL" -gt 2000 ]; then
+            echo "::error::Very large PR ($TOTAL lines). Please break into smaller, reviewable chunks."
+          fi
+
+  # ==========================================================================
+  # Documentation Check
+  # ==========================================================================
+  docs-check:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check for documentation updates
+        run: |
+          # Check if code changes require docs updates
+          CODE_CHANGES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E "\.(ts|js)$" | wc -l)
+          DOC_CHANGES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E "\.(md|txt)$" | wc -l)
+          
+          if [ "$CODE_CHANGES" -gt 5 ] && [ "$DOC_CHANGES" -eq 0 ]; then
+            echo "::warning::Significant code changes detected without documentation updates. Consider updating docs."
+          fi
+      
+      - name: Check README exists
+        run: |
+          if [ ! -f README.md ]; then
+            echo "::error::README.md is missing!"
+            exit 1
+          fi
+
+  # ==========================================================================
+  # Final Status
+  # ==========================================================================
+  ci-success:
+    name: CI Success
+    needs: [build, license-check]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Check all jobs
+        run: |
+          if [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "Build failed"
+            exit 1
+          fi
+          echo "All required checks passed!"

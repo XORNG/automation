@@ -1,0 +1,28 @@
+# CODEOWNERS - Automatic review assignment for XORNG repositories
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in the repo
+* @XORNG/core-maintainers
+
+# Security-related changes require security team review
+SECURITY.md @XORNG/security-team
+.github/workflows/security.yml @XORNG/security-team
+.github/dependabot.yml @XORNG/security-team
+
+# CI/CD changes require DevOps review
+.github/workflows/*.yml @XORNG/devops
+Dockerfile @XORNG/devops
+docker-compose.yml @XORNG/devops
+
+# Documentation changes
+*.md @XORNG/docs-team
+documentation/ @XORNG/docs-team
+
+# Configuration files
+*.json @XORNG/core-maintainers
+*.yml @XORNG/core-maintainers
+*.yaml @XORNG/core-maintainers
+tsconfig.json @XORNG/core-maintainers
+
+# Source code
+src/ @XORNG/core-maintainers
