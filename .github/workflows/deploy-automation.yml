@@ -116,6 +116,9 @@ jobs:
             AUTOMATION_IMAGE=${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}:latest
             EOF
             
+            # Login to GitHub Container Registry
+            echo "${{ secrets.GH_AUTOMATION_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
             # Pull latest image
             echo "Pulling latest image..."
             docker pull "${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}:latest"
