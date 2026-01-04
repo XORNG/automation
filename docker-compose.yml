@@ -32,12 +32,10 @@ services:
       - xorng-network
 
   # ===========================================
-  # XORNG Automation Server (Webhook + Feedback API)
+  # XORNG Automation Server (Webhook + Orchestrator)
+  # Dynamically discovers and deploys services
   # ===========================================
   automation-server:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: ${AUTOMATION_IMAGE:-ghcr.io/xorng/xorng-automation:latest}
     container_name: xorng-automation
     restart: unless-stopped
@@ -49,6 +47,10 @@ services:
       - PORT=3000
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - REDIS_URL=redis://redis:6379
+      # Dynamic service discovery settings
+      - SERVICE_DISCOVERY_ENABLED=true
+      - REGISTRY_URL=ghcr.io
+      - AUTO_DEPLOY_SERVICES=true
     depends_on:
       redis:
         condition: service_healthy
@@ -58,9 +60,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    # Mount Docker socket so automation can manage other containers
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - xorng-network
-    # Traefik labels (only apply when using with-domain profile)
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.automation.rule=Host(`${AUTOMATION_DOMAIN}`)"
@@ -68,12 +72,11 @@ services:
       - "traefik.http.routers.automation.tls=true"
       - "traefik.http.routers.automation.tls.certresolver=letsencrypt"
       - "traefik.http.services.automation.loadbalancer.server.port=3000"
-    # Port mapping only when NOT using Traefik (no profile)
     ports:
       - "${AUTOMATION_PORT:-3001}:3000"
 
   # ===========================================
-  # Redis for memory system
+  # Redis for memory/state
   # ===========================================
   redis:
     image: redis:7-alpine
@@ -90,56 +93,20 @@ services:
     networks:
       - xorng-network
 
-  # ===========================================
-  # XORNG Core orchestrator
-  # ===========================================
-  xorng-core:
-    build:
-      context: ../core
-      dockerfile: Dockerfile
-    container_name: xorng-core
-    restart: unless-stopped
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - NODE_ENV=production
-    depends_on:
-      redis:
-        condition: service_healthy
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - xorng-network
-    labels:
-      - "traefik.enable=false"
-
-  # ===========================================
-  # Code Review Validator
-  # ===========================================
-  validator-code-review:
-    build:
-      context: ../validator-code-review
-      dockerfile: Dockerfile
-    container_name: xorng-validator-code-review
-    restart: unless-stopped
-    environment:
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-    networks:
-      - xorng-network
-
-  # ===========================================
-  # Security Validator
-  # ===========================================
-  validator-security:
-    build:
-      context: ../validator-security
-      dockerfile: Dockerfile
-    container_name: xorng-validator-security
-    restart: unless-stopped
-    environment:
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-    networks:
-      - xorng-network
+# ===========================================
+# NOTE: Validators, Knowledge, Task services are NOT defined here!
+# They are dynamically discovered and deployed by the automation-server
+# based on:
+#   1. GitHub org repositories with specific topics (xorng-validator, xorng-knowledge, etc.)
+#   2. Container registry images matching pattern ghcr.io/xorng/xorng-*
+#   3. Repository package.json/Dockerfile presence
+#
+# The automation-server will:
+#   - Scan the org for service repos
+#   - Build/pull images as needed
+#   - Deploy services with proper networking
+#   - Register them with Traefik automatically
+# ===========================================
 
 volumes:
   redis-data:

@@ -15,6 +15,7 @@ import { WebhookServer, type WebhookServerConfig } from './webhook-server.js';
 import { GitHubOrgService } from './github-org-service.js';
 import { IssueProcessor } from './issue-processor.js';
 import { FeedbackService } from './feedback-service.js';
+import { ServiceOrchestrator } from './service-orchestrator.js';
 import { pino } from 'pino';
 
 const logger = pino({
@@ -33,6 +34,10 @@ interface ServerConfig {
   webhookSecret?: string;
   webhookUrl?: string;
   logLevel: string;
+  // Dynamic service orchestration
+  serviceDiscoveryEnabled: boolean;
+  registryUrl: string;
+  autoDeployServices: boolean;
 }
 
 /**
@@ -47,6 +52,10 @@ function loadConfig(): ServerConfig {
     webhookSecret: process.env.WEBHOOK_SECRET,
     webhookUrl: process.env.WEBHOOK_URL,
     logLevel: process.env.LOG_LEVEL || 'info',
+    // Dynamic service orchestration
+    serviceDiscoveryEnabled: process.env.SERVICE_DISCOVERY_ENABLED === 'true',
+    registryUrl: process.env.REGISTRY_URL || 'ghcr.io',
+    autoDeployServices: process.env.AUTO_DEPLOY_SERVICES === 'true',
   };
 
   if (!config.githubToken) {
@@ -66,6 +75,7 @@ export class AutomationServer {
   private githubOrgService: GitHubOrgService;
   private issueProcessor: IssueProcessor;
   private feedbackService: FeedbackService;
+  private serviceOrchestrator?: ServiceOrchestrator;
 
   constructor(config: ServerConfig) {
     this.config = config;
@@ -95,6 +105,19 @@ export class AutomationServer {
     this.feedbackService = new FeedbackService({
       logLevel: config.logLevel,
     });
+
+    // Initialize service orchestrator if enabled
+    if (config.serviceDiscoveryEnabled) {
+      this.serviceOrchestrator = new ServiceOrchestrator({
+        githubToken: config.githubToken,
+        organization: config.githubOrganization,
+        registryUrl: config.registryUrl,
+        registryPassword: config.githubToken, // Use same token for GHCR
+        networkName: 'xorng-network',
+        autoDeployEnabled: config.autoDeployServices,
+        logLevel: config.logLevel,
+      });
+    }
 
     this.setupEventHandlers();
   }
@@ -287,6 +310,19 @@ export class AutomationServer {
       }
     }, 5 * 60 * 1000); // Every 5 minutes
 
+    // Start service orchestrator if enabled
+    if (this.serviceOrchestrator) {
+      logger.info('Starting dynamic service orchestrator...');
+      await this.serviceOrchestrator.start(5 * 60 * 1000); // Poll every 5 minutes
+      
+      const status = await this.serviceOrchestrator.getStatus();
+      logger.info({
+        discovered: status.discovered.length,
+        running: status.running.length,
+        pending: status.pending.length,
+      }, 'Service orchestrator started');
+    }
+
     logger.info('XORNG Automation Server started successfully');
   }
 
@@ -295,6 +331,9 @@ export class AutomationServer {
    */
   async stop(): Promise<void> {
     logger.info('Stopping XORNG Automation Server');
+    if (this.serviceOrchestrator) {
+      this.serviceOrchestrator.stop();
+    }
     await this.webhookServer.stop();
     logger.info('XORNG Automation Server stopped');
   }
@@ -308,7 +347,41 @@ export class AutomationServer {
       githubOrgService: this.githubOrgService,
       issueProcessor: this.issueProcessor,
       feedbackService: this.feedbackService,
+      serviceOrchestrator: this.serviceOrchestrator,
     };
+  }
+
+  /**
+   * Get service orchestrator status
+   */
+  async getServiceStatus() {
+    if (!this.serviceOrchestrator) {
+      return { enabled: false, message: 'Service orchestrator not enabled' };
+    }
+    return {
+      enabled: true,
+      ...(await this.serviceOrchestrator.getStatus()),
+    };
+  }
+
+  /**
+   * Manually trigger service sync
+   */
+  async syncServices(removeOrphans: boolean = false) {
+    if (!this.serviceOrchestrator) {
+      throw new Error('Service orchestrator not enabled');
+    }
+    await this.serviceOrchestrator.syncServices(removeOrphans);
+  }
+
+  /**
+   * Redeploy a specific service
+   */
+  async redeployService(serviceName: string) {
+    if (!this.serviceOrchestrator) {
+      throw new Error('Service orchestrator not enabled');
+    }
+    await this.serviceOrchestrator.redeployService(serviceName);
   }
 }
 
