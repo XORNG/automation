@@ -4,7 +4,7 @@ services:
   # Only used when AUTOMATION_DOMAIN is set
   # ===========================================
   traefik:
-    image: traefik:v2.11
+    image: traefik:3.6
     container_name: traefik
     restart: unless-stopped
     profiles:
