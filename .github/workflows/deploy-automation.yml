@@ -135,6 +135,11 @@ jobs:
               # Add webhook URL to .env
               echo "WEBHOOK_URL=https://${DOMAIN}/webhook/github" >> .env
               
+              # Update traefik-dynamic.yml with actual domain
+              echo "=== Configuring Traefik dynamic config ==="
+              sed -i "s/AUTOMATION_DOMAIN_PLACEHOLDER/${DOMAIN}/g" traefik-dynamic.yml
+              cat traefik-dynamic.yml
+              
               # Debug: Show network and container state before deployment
               echo "=== Debug: Docker Networks ==="
               docker network ls
@@ -176,8 +181,21 @@ jobs:
             docker image prune -f
             
             # Health check with retry logic
-            echo "Waiting for service to start..."
-            MAX_RETRIES=6
+            # Wait for container to become healthy first (Traefik only routes healthy containers)
+            echo "Waiting for container to become healthy..."
+            for i in $(seq 1 12); do
+              HEALTH=$(docker inspect --format='{{.State.Health.Status}}' xorng-automation 2>/dev/null || echo "unknown")
+              if [ "$HEALTH" = "healthy" ]; then
+                echo "✅ Container is healthy, Traefik should now discover it"
+                break
+              fi
+              echo "Container health status: $HEALTH (attempt $i/12)"
+              sleep 5
+            done
+            
+            # Now check external access (HTTPS)
+            echo "Checking external access..."
+            MAX_RETRIES=12
             RETRY_INTERVAL=10
             
             for i in $(seq 1 $MAX_RETRIES); do
