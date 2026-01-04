@@ -88,10 +88,10 @@ export class GitHubOrgService {
     return {
       id: data.id,
       login: data.login,
-      name: data.name,
-      description: data.description,
+      name: data.name ?? null,
+      description: data.description ?? null,
       htmlUrl: data.html_url,
-      membersCount: data.members_count,
+      membersCount: data.public_repos, // members_count not available in API response
       reposCount: data.public_repos + (data.total_private_repos || 0),
     };
   }
@@ -147,19 +147,19 @@ export class GitHubOrgService {
           name: repo.name,
           fullName: repo.full_name,
           owner: repo.owner.login,
-          description: repo.description,
+          description: repo.description ?? null,
           isPrivate: repo.private,
-          defaultBranch: repo.default_branch,
-          language: repo.language,
+          defaultBranch: repo.default_branch ?? 'main',
+          language: repo.language ?? null,
           topics: repo.topics || [],
           htmlUrl: repo.html_url,
-          cloneUrl: repo.clone_url,
-          sshUrl: repo.ssh_url,
-          archived: repo.archived,
-          disabled: repo.disabled,
-          createdAt: repo.created_at,
-          updatedAt: repo.updated_at,
-          pushedAt: repo.pushed_at,
+          cloneUrl: repo.clone_url ?? '',
+          sshUrl: repo.ssh_url ?? '',
+          archived: repo.archived ?? false,
+          disabled: repo.disabled ?? false,
+          createdAt: repo.created_at ?? new Date().toISOString(),
+          updatedAt: repo.updated_at ?? new Date().toISOString(),
+          pushedAt: repo.pushed_at ?? null,
         };
 
         repositories.push(repoInfo);
