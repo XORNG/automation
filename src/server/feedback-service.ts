@@ -163,6 +163,21 @@ export class FeedbackService extends EventEmitter {
   }
 
   /**
+   * Record feedback for a task - simplified method for rating feedback
+   */
+  recordFeedback(taskId: string, rating: number, comments?: string): FeedbackEntry {
+    return this.submitFeedback({
+      type: 'rating',
+      source: 'automation-server',
+      data: {
+        taskId,
+        rating,
+        message: comments,
+      },
+    });
+  }
+
+  /**
    * Update statistics based on feedback
    */
   private updateStats(feedback: FeedbackEntry): void {

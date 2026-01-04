@@ -267,6 +267,23 @@ export class MetricsService {
   }
 
   /**
+   * Set queue depth for a specific status
+   */
+  setQueueDepth(status: string, value: number): void {
+    issueMetrics.queueDepth.set({ status }, value);
+  }
+
+  /**
+   * Observe webhook processing duration
+   */
+  observeWebhook(event: string, status: 'success' | 'error', durationMs: number): void {
+    webhookMetrics.received.inc({ event, repository: 'unknown' });
+    if (status === 'error') {
+      webhookMetrics.processingErrors.inc({ event, error_type: 'processing' });
+    }
+  }
+
+  /**
    * Record AI request
    */
   recordAIRequest(

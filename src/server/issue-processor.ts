@@ -164,6 +164,53 @@ export class IssueProcessor extends EventEmitter {
   }
 
   /**
+   * Process a specific issue by owner, repo, and number
+   * Used by queue-based job processing
+   */
+  async processIssue(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    action: string
+  ): Promise<ProcessingTask | null> {
+    this.logger.info({ owner, repo, issueNumber, action }, 'Processing issue from queue');
+
+    try {
+      // Fetch issue details from GitHub
+      const { data: issue } = await this.octokit.issues.get({
+        owner,
+        repo,
+        issue_number: issueNumber,
+      });
+
+      // Create task from fetched issue
+      return this.processIssueEvent({
+        action,
+        issue: {
+          id: issue.id,
+          number: issue.number,
+          title: issue.title,
+          body: issue.body ?? null,
+          state: issue.state,
+          labels: (issue.labels as Array<{ name?: string; color?: string }>)
+            .filter((l): l is { name: string; color: string } => typeof l.name === 'string')
+            .map(l => ({ name: l.name, color: l.color ?? '' })),
+          author: issue.user?.login ?? 'unknown',
+          repository: repo,
+          repositoryOwner: owner,
+          htmlUrl: issue.html_url,
+          createdAt: issue.created_at,
+          updatedAt: issue.updated_at,
+        },
+        repository: { name: repo, owner: { login: owner } },
+      });
+    } catch (error) {
+      this.logger.error({ error, owner, repo, issueNumber }, 'Failed to process issue');
+      return null;
+    }
+  }
+
+  /**
    * Process a pull request event from GitHub webhook
    */
   async processPullRequestEvent(payload: {

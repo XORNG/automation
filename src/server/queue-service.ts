@@ -1,4 +1,4 @@
-import { Queue, Worker, Job, QueueScheduler, QueueEvents, type ConnectionOptions } from 'bullmq';
+import { Queue, Worker, Job, QueueEvents, type ConnectionOptions } from 'bullmq';
 import { pino, type Logger } from 'pino';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
@@ -389,16 +389,29 @@ export class QueueService extends EventEmitter {
    * Get queue statistics
    */
   async getStats(): Promise<QueueStats> {
-    const [waiting, active, completed, failed, delayed, paused] = await Promise.all([
+    const [waiting, active, completed, failed, delayed] = await Promise.all([
       this.queue.getWaitingCount(),
       this.queue.getActiveCount(),
       this.queue.getCompletedCount(),
       this.queue.getFailedCount(),
       this.queue.getDelayedCount(),
-      this.queue.getPausedCount(),
     ]);
 
-    return { waiting, active, completed, failed, delayed, paused };
+    return { waiting, active, completed, failed, delayed, paused: 0 };
+  }
+
+  /**
+   * Get job counts - alias for getStats for compatibility
+   */
+  async getJobCounts(): Promise<QueueStats> {
+    return this.getStats();
+  }
+
+  /**
+   * Close the queue service - alias for shutdown for compatibility
+   */
+  async close(): Promise<void> {
+    return this.shutdown();
   }
 
   /**

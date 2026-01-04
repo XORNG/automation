@@ -476,37 +476,33 @@ export class AutomationServer {
   /**
    * Process a job from the queue
    */
-  private async processQueueJob(jobData: {
-    type: string;
-    payload: unknown;
-    metadata?: Record<string, unknown>;
-  }): Promise<unknown> {
-    const { type, payload } = jobData;
+  private async processQueueJob(jobData: JobData): Promise<JobResult> {
+    const { type, data } = jobData;
     
     switch (type) {
       case 'issue':
-        return this.processIssueJob(payload as {
-          repo: string;
-          owner: string;
-          issueNumber: number;
-          action: string;
+        return this.processIssueJob({
+          repo: data.repository,
+          owner: data.repositoryOwner,
+          issueNumber: data.number,
+          action: data.action,
         });
-      case 'pull_request':
-        return this.processPullRequestJob(payload as {
-          repo: string;
-          owner: string;
-          prNumber: number;
-          action: string;
+      case 'pr':
+        return this.processPullRequestJob({
+          repo: data.repository,
+          owner: data.repositoryOwner,
+          prNumber: data.number,
+          action: data.action,
         });
       case 'feedback':
-        return this.processFeedbackJob(payload as {
-          taskId: string;
-          rating: number;
-          comments?: string;
+        return this.processFeedbackJob({
+          taskId: String(data.data['taskId'] || ''),
+          rating: Number(data.data['rating'] || 0),
+          comments: data.data['comments'] as string | undefined,
         });
       default:
         logger.warn({ type }, 'Unknown job type');
-        return null;
+        return { success: false, error: `Unknown job type: ${type}` };
     }
   }
 
@@ -515,13 +511,13 @@ export class AutomationServer {
     owner: string;
     issueNumber: number;
     action: string;
-  }) {
+  }): Promise<JobResult> {
     const { repo, owner, issueNumber, action } = payload;
     logger.info({ repo, owner, issueNumber, action }, 'Processing issue job');
     
     // Delegate to issue processor
     const task = await this.issueProcessor.processIssue(owner, repo, issueNumber, action);
-    return task;
+    return { success: !!task, message: task ? `Processed issue #${issueNumber}` : 'Failed to process issue' };
   }
 
   private async processPullRequestJob(payload: {
@@ -529,22 +525,22 @@ export class AutomationServer {
     owner: string;
     prNumber: number;
     action: string;
-  }) {
+  }): Promise<JobResult> {
     const { repo, owner, prNumber, action } = payload;
     logger.info({ repo, owner, prNumber, action }, 'Processing pull request job');
     // PR processing logic would go here
-    return { processed: true };
+    return { success: true, message: `Processed PR #${prNumber}` };
   }
 
   private async processFeedbackJob(payload: {
     taskId: string;
     rating: number;
     comments?: string;
-  }) {
+  }): Promise<JobResult> {
     const { taskId, rating, comments } = payload;
     logger.info({ taskId, rating }, 'Processing feedback job');
     this.feedbackService.recordFeedback(taskId, rating, comments);
-    return { recorded: true };
+    return { success: true, message: 'Feedback recorded' };
   }
 
   /**
