@@ -43,7 +43,7 @@ services:
     restart: unless-stopped
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - GITHUB_ORG=${GITHUB_ORG:-XORNG}
+      - GH_ORG=${GH_ORG:-XORNG}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
       - WEBHOOK_URL=${WEBHOOK_URL:-https://${AUTOMATION_DOMAIN}/webhook/github}
       - PORT=3000

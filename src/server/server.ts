@@ -43,7 +43,7 @@ function loadConfig(): ServerConfig {
     port: parseInt(process.env.PORT || '3000', 10),
     host: process.env.HOST || '0.0.0.0',
     githubToken: process.env.GITHUB_TOKEN || '',
-    githubOrganization: process.env.GITHUB_ORG || 'XORNG',
+    githubOrganization: process.env.GH_ORG || 'XORNG',
     webhookSecret: process.env.WEBHOOK_SECRET,
     webhookUrl: process.env.WEBHOOK_URL,
     logLevel: process.env.LOG_LEVEL || 'info',

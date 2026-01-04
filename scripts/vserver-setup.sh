@@ -138,7 +138,7 @@ echo "   │ VSERVER_USER        │ deploy                                     
 echo "   │ VSERVER_SSH_KEY     │ (contents of ~/.ssh/xorng-deploy private key)      │"
 echo "   │ GH_AUTOMATION_TOKEN │ GitHub token with repo & admin:org scopes          │"
 echo "   │ WEBHOOK_SECRET      │ $(openssl rand -hex 32)                            │"
-echo "   │ GITHUB_ORG          │ Your organization name (e.g., XORNG)               │"
+echo "   │ GH_ORG              │ Your organization name (e.g., XORNG)               │"
 echo "   └─────────────────────┴────────────────────────────────────────────────────┘"
 echo ""
 echo "   FOR DOMAIN + HTTPS (Recommended):"
