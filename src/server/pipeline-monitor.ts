@@ -615,6 +615,13 @@ export class PipelineMonitor extends EventEmitter {
       const prompt = this.buildFailureAnalysisPrompt(data);
       
       const systemPrompt = `You are an expert CI/CD pipeline debugger. Analyze pipeline failures and suggest specific, actionable fixes.
+
+CRITICAL RULES:
+1. ONLY suggest fixes for files that are EXPLICITLY mentioned in the error messages or affected files list
+2. Do NOT suggest fixing files that don't exist or weren't mentioned in the error output
+3. If the error is about a missing file or workflow, set autoFixable to false
+4. For Dependabot PRs (dependency updates), most fixes should be marked as NOT auto-fixable
+
 Your response must be valid JSON with this structure:
 {
   "fixes": [
@@ -622,6 +629,7 @@ Your response must be valid JSON with this structure:
       "file": "path/to/file.ts",
       "description": "Description of the fix",
       "suggestedCode": "The actual code fix",
+      "originalCode": "The code to replace (if modifying existing code)",
       "lineStart": 10,
       "lineEnd": 15,
       "confidence": 0.9
@@ -638,8 +646,13 @@ For common issues:
 - Test failures: Explain what needs to change (usually not auto-fixable)
 - Format errors: These are always auto-fixable with formatter
 - Build errors: Provide specific code fixes
+- Missing workflow files: NOT auto-fixable - requires manual intervention
+- License/compliance issues: Usually NOT auto-fixable
 
-Be conservative with autoFixable - only true if you're confident the fix won't break anything.
+Be conservative with autoFixable - only true if:
+1. You're confident the fix won't break anything
+2. The file exists and was mentioned in the error output
+3. The fix is straightforward and well-understood
 
 ${knowledgeContext}${learnedPatternsContext}`;
       
@@ -1356,8 +1369,28 @@ Please analyze this failure and provide specific fixes. Be precise about file pa
                 });
               }
             }
-          } catch (error) {
-            this.logger.warn({ error, file: fix.file }, 'Failed to get file content for fix');
+          } catch (error: unknown) {
+            // Handle 404 errors specifically - file doesn't exist on this branch
+            const httpError = error as { status?: number };
+            if (httpError.status === 404) {
+              this.logger.info({ 
+                file: fix.file, 
+                branch,
+                suggestion: 'File may need to be created or AI suggested wrong file'
+              }, 'File does not exist on branch, skipping fix');
+              
+              // If this is a new file suggestion (has full content), we could create it
+              if (fix.suggestedCode && !fix.originalCode && !fix.lineStart) {
+                this.logger.info({ file: fix.file }, 'Treating as new file creation');
+                fixes.push({
+                  path: fix.file,
+                  content: fix.suggestedCode,
+                  description: `Create new file: ${fix.description}`,
+                });
+              }
+            } else {
+              this.logger.warn({ error, file: fix.file }, 'Failed to get file content for fix');
+            }
           }
         }
       }
