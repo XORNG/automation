@@ -1,13 +1,10 @@
 {
-  "name": "@xorng/automation",
-  "version": "0.1.0",
-  "description": "XORNG Framework automation and orchestration",
-  "type": "module",
-  "bin": {
-    "xorng": "./dist/index.js",
-    "xorng-server": "./dist/server/server.js"
-  },
   "scripts": {
+    "prebuild": "npm ci",
+    "build": "tsc && vite build",
+    "build:verbose": "echo 'Starting build' && tsc --noEmit && vite build --logLevel info"
+  }
+}
     "build": "tsc",
     "start": "node dist/index.js",
     "start:server": "node dist/server/server.js",
