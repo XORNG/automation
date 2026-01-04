@@ -10,16 +10,40 @@ on:
       - 'docker-compose.yml'
       - 'package.json'
       - '.github/workflows/deploy-automation.yml'
+      - '!**/*.md'
+      - '!**/*.test.ts'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       force_deploy:
         description: 'Force deployment even without changes'
         required: false
         default: 'false'
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_tests:
+        description: 'Skip test suite'
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
   # Note: IMAGE_NAME is set dynamically in steps to ensure lowercase
+
+# Permissions for OIDC token generation and package publishing
+permissions:
+  contents: read
+  packages: write
+  id-token: write  # Required for OIDC authentication
 
 jobs:
   build:

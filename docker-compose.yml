@@ -58,6 +58,11 @@ services:
       - PORT=3000
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - REDIS_URL=redis://redis:6379
+      # Queue settings
+      - QUEUE_CONCURRENCY=${QUEUE_CONCURRENCY:-10}
+      - QUEUE_ATTEMPTS=${QUEUE_ATTEMPTS:-3}
+      - QUEUE_RATE_LIMIT_MAX=${QUEUE_RATE_LIMIT_MAX:-100}
+      - QUEUE_RATE_LIMIT_DURATION=${QUEUE_RATE_LIMIT_DURATION:-60000}
       # Dynamic service discovery settings
       - SERVICE_DISCOVERY_ENABLED=true
       - REGISTRY_URL=ghcr.io
@@ -65,15 +70,32 @@ services:
       # AI Provider Configuration (OpenRouter)
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - OPENROUTER_MODEL=${OPENROUTER_MODEL:-anthropic/claude-sonnet-4}
+      # Metrics
+      - METRICS_ENABLED=${METRICS_ENABLED:-true}
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
-      interval: 10s
-      timeout: 5s
+      interval: 30s
+      timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 30s
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    # Logging configuration
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     # Mount Docker socket so automation can manage other containers
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -100,7 +122,7 @@ services:
       - "${AUTOMATION_PORT:-3001}:3000"
 
   # ===========================================
-  # Redis for memory/state
+  # Redis for memory/state and job queue
   # ===========================================
   redis:
     image: redis:7-alpine
@@ -108,12 +130,31 @@ services:
     restart: unless-stopped
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+      --timeout 0
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - xorng-network
 

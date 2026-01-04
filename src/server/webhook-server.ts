@@ -3,6 +3,7 @@ import { createServer, type Server } from 'http';
 import crypto from 'crypto';
 import { pino, type Logger } from 'pino';
 import { EventEmitter } from 'events';
+import { metricsRegistry, metricsService } from './metrics.js';
 
 /**
  * Webhook server configuration
@@ -223,6 +224,18 @@ export class WebhookServer extends EventEmitter {
       });
     });
 
+    // Prometheus metrics endpoint
+    app.get('/metrics', async (_req, res) => {
+      try {
+        res.set('Content-Type', metricsRegistry.contentType);
+        const metrics = await metricsRegistry.metrics();
+        res.end(metrics);
+      } catch (error) {
+        this.logger.error({ error }, 'Failed to collect metrics');
+        res.status(500).end('Error collecting metrics');
+      }
+    });
+
     // GitHub webhook endpoint
     app.post('/webhook/github', this.handleGitHubWebhook.bind(this));
 
@@ -262,6 +275,7 @@ export class WebhookServer extends EventEmitter {
    * Handle GitHub webhook
    */
   private async handleGitHubWebhook(req: Request, res: Response): Promise<void> {
+    const startTime = Date.now();
     const signature = req.headers['x-hub-signature-256'] as string | undefined;
     const event = req.headers['x-github-event'] as GitHubEventType | undefined;
     const deliveryId = req.headers['x-github-delivery'] as string | undefined;
@@ -269,6 +283,7 @@ export class WebhookServer extends EventEmitter {
     // Verify signature
     if (!this.verifyWebhookSignature(req.body as Buffer, signature)) {
       this.logger.error({ deliveryId }, 'Invalid webhook signature');
+      metricsService.observeWebhook(event || 'unknown', 'error', Date.now() - startTime);
       res.status(401).json({ error: 'Invalid signature' });
       return;
     }
@@ -279,6 +294,7 @@ export class WebhookServer extends EventEmitter {
       payload = JSON.parse((req.body as Buffer).toString());
     } catch (error) {
       this.logger.error({ error, deliveryId }, 'Failed to parse webhook payload');
+      metricsService.observeWebhook(event || 'unknown', 'error', Date.now() - startTime);
       res.status(400).json({ error: 'Invalid JSON payload' });
       return;
     }
@@ -298,6 +314,9 @@ export class WebhookServer extends EventEmitter {
       event,
       action: payload.action,
     });
+
+    // Record metrics
+    metricsService.observeWebhook(event || 'unknown', 'success', Date.now() - startTime);
 
     // Emit event for processing
     this.emit('github:webhook', {

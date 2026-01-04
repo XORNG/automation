@@ -9,6 +9,9 @@
  * - VS Code extension feedback loop
  * - Issue processing without label filtering (testing phase)
  * - Automatic repository discovery
+ * - Persistent job queue with BullMQ
+ * - Prometheus metrics for observability
+ * - Circuit breakers for resilience
  */
 
 import { WebhookServer, type WebhookServerConfig } from './webhook-server.js';
@@ -17,6 +20,9 @@ import { IssueProcessor } from './issue-processor.js';
 import { FeedbackService } from './feedback-service.js';
 import { ServiceOrchestrator } from './service-orchestrator.js';
 import { AIService, createAIServiceFromEnv } from './ai-service.js';
+import { QueueService, createQueueServiceFromEnv, type JobData, type JobResult } from './queue-service.js';
+import { metricsService, metricsRegistry } from './metrics.js';
+import { CircuitBreaker, circuitBreakerRegistry } from '../utils/circuit-breaker.js';
 import { pino } from 'pino';
 
 const logger = pino({
@@ -35,6 +41,9 @@ interface ServerConfig {
   webhookSecret?: string;
   webhookUrl?: string;
   logLevel: string;
+  // Redis/Queue configuration
+  redisUrl: string;
+  queueEnabled: boolean;
   // Dynamic service orchestration
   serviceDiscoveryEnabled: boolean;
   registryUrl: string;
@@ -43,6 +52,8 @@ interface ServerConfig {
   openRouterApiKey?: string;
   openRouterModel?: string;
   aiEnabled: boolean;
+  // Metrics
+  metricsEnabled: boolean;
 }
 
 /**
@@ -57,6 +68,9 @@ function loadConfig(): ServerConfig {
     webhookSecret: process.env.WEBHOOK_SECRET,
     webhookUrl: process.env.WEBHOOK_URL,
     logLevel: process.env.LOG_LEVEL || 'info',
+    // Redis/Queue configuration
+    redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
+    queueEnabled: process.env.QUEUE_ENABLED !== 'false',
     // Dynamic service orchestration
     serviceDiscoveryEnabled: process.env.SERVICE_DISCOVERY_ENABLED === 'true',
     registryUrl: process.env.REGISTRY_URL || 'ghcr.io',
@@ -65,6 +79,8 @@ function loadConfig(): ServerConfig {
     openRouterApiKey: process.env.OPENROUTER_API_KEY,
     openRouterModel: process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4',
     aiEnabled: !!process.env.OPENROUTER_API_KEY,
+    // Metrics
+    metricsEnabled: process.env.METRICS_ENABLED !== 'false',
   };
 
   if (!config.githubToken) {
@@ -86,9 +102,34 @@ export class AutomationServer {
   private feedbackService: FeedbackService;
   private serviceOrchestrator?: ServiceOrchestrator;
   private aiService: AIService;
+  private queueService?: QueueService;
+  private isShuttingDown = false;
+  private cleanupIntervals: NodeJS.Timeout[] = [];
+  
+  // Circuit breakers for external services
+  private githubCircuitBreaker: CircuitBreaker;
+  private aiCircuitBreaker: CircuitBreaker;
 
   constructor(config: ServerConfig) {
     this.config = config;
+
+    // Initialize circuit breakers
+    this.githubCircuitBreaker = circuitBreakerRegistry.getBreaker({
+      name: 'github-api',
+      failureThreshold: 5,
+      resetTimeout: 60000,
+      callTimeout: 30000,
+    });
+    
+    this.aiCircuitBreaker = circuitBreakerRegistry.getBreaker({
+      name: 'openrouter-api',
+      failureThreshold: 3,
+      resetTimeout: 120000,
+      callTimeout: 60000,
+    });
+    
+    // Setup circuit breaker metrics
+    this.setupCircuitBreakerMetrics();
 
     // Initialize AI service (OpenRouter)
     this.aiService = new AIService({
@@ -139,7 +180,33 @@ export class AutomationServer {
       });
     }
 
+    // Initialize queue service if enabled
+    if (config.queueEnabled) {
+      this.queueService = new QueueService({
+        redisUrl: config.redisUrl,
+        logLevel: config.logLevel,
+      });
+    }
+
     this.setupEventHandlers();
+  }
+
+  /**
+   * Setup circuit breaker metrics tracking
+   */
+  private setupCircuitBreakerMetrics(): void {
+    const breakers = [this.githubCircuitBreaker, this.aiCircuitBreaker];
+    
+    for (const breaker of breakers) {
+      breaker.on('stateChange', (from, to) => {
+        metricsService.updateCircuitBreakerState(breaker.getStats().name, to);
+        metricsService.recordCircuitBreakerStateChange(breaker.getStats().name, from, to);
+      });
+      
+      breaker.on('failure', () => {
+        metricsService.recordCircuitBreakerFailure(breaker.getStats().name);
+      });
+    }
   }
 
   /**
@@ -290,9 +357,29 @@ export class AutomationServer {
     // Start webhook server
     await this.webhookServer.start();
 
+    // Start queue service if enabled
+    if (this.queueService) {
+      logger.info('Starting BullMQ queue service...');
+      this.queueService.startWorker(async (job) => {
+        return this.processQueueJob(job.data);
+      });
+      
+      // Setup queue event metrics
+      this.queueService.on('job:completed', () => {
+        this.updateQueueMetrics();
+      });
+      this.queueService.on('job:failed', () => {
+        this.updateQueueMetrics();
+      });
+      
+      logger.info('Queue service started');
+    }
+
     // Discover all repositories
     logger.info('Discovering organization repositories...');
-    const repos = await this.githubOrgService.listRepositories();
+    const repos = await this.githubCircuitBreaker.execute(async () => {
+      return this.githubOrgService.listRepositories();
+    });
     logger.info({ count: repos.length }, 'Discovered repositories');
 
     // Register webhooks for all repositories if webhook URL is configured
@@ -317,30 +404,53 @@ export class AutomationServer {
     logger.info({ taskCount: allTasks.length }, 'Initial sync complete');
 
     // Start periodic cleanup
-    setInterval(() => {
+    const cleanupInterval = setInterval(() => {
       this.issueProcessor.cleanupOldTasks(24);
       this.feedbackService.cleanup(30);
+      if (this.queueService) {
+        this.queueService.clean(7 * 24 * 60 * 60 * 1000, 1000, 'completed');
+        this.queueService.clean(30 * 24 * 60 * 60 * 1000, 1000, 'failed');
+      }
     }, 60 * 60 * 1000); // Every hour
+    this.cleanupIntervals.push(cleanupInterval);
 
     // Start periodic repository check for new repos
-    setInterval(async () => {
-      const newRepos = await this.githubOrgService.checkForNewRepositories();
-      if (newRepos.length > 0 && this.config.webhookUrl) {
-        for (const repo of newRepos) {
-          try {
-            await this.githubOrgService.registerWebhook(
-              repo.name,
-              this.config.webhookUrl,
-              ['issues', 'issue_comment', 'pull_request', 'pull_request_review'],
-              this.config.webhookSecret
-            );
-            logger.info({ repo: repo.name }, 'Registered webhook for new repository');
-          } catch (error) {
-            logger.error({ error, repo: repo.name }, 'Failed to register webhook');
+    const repoCheckInterval = setInterval(async () => {
+      if (this.isShuttingDown) return;
+      
+      try {
+        const newRepos = await this.githubCircuitBreaker.execute(async () => {
+          return this.githubOrgService.checkForNewRepositories();
+        });
+        
+        if (newRepos.length > 0 && this.config.webhookUrl) {
+          for (const repo of newRepos) {
+            try {
+              await this.githubOrgService.registerWebhook(
+                repo.name,
+                this.config.webhookUrl,
+                ['issues', 'issue_comment', 'pull_request', 'pull_request_review'],
+                this.config.webhookSecret
+              );
+              logger.info({ repo: repo.name }, 'Registered webhook for new repository');
+            } catch (error) {
+              logger.error({ error, repo: repo.name }, 'Failed to register webhook');
+            }
           }
         }
+      } catch (error) {
+        logger.error({ error }, 'Failed to check for new repositories');
       }
     }, 5 * 60 * 1000); // Every 5 minutes
+    this.cleanupIntervals.push(repoCheckInterval);
+
+    // Start metrics update interval
+    if (this.config.metricsEnabled) {
+      const metricsInterval = setInterval(() => {
+        this.updateQueueMetrics();
+      }, 30000); // Every 30 seconds
+      this.cleanupIntervals.push(metricsInterval);
+    }
 
     // Start service orchestrator if enabled
     if (this.serviceOrchestrator) {
@@ -364,15 +474,158 @@ export class AutomationServer {
   }
 
   /**
-   * Stop the server
+   * Process a job from the queue
+   */
+  private async processQueueJob(jobData: {
+    type: string;
+    payload: unknown;
+    metadata?: Record<string, unknown>;
+  }): Promise<unknown> {
+    const { type, payload } = jobData;
+    
+    switch (type) {
+      case 'issue':
+        return this.processIssueJob(payload as {
+          repo: string;
+          owner: string;
+          issueNumber: number;
+          action: string;
+        });
+      case 'pull_request':
+        return this.processPullRequestJob(payload as {
+          repo: string;
+          owner: string;
+          prNumber: number;
+          action: string;
+        });
+      case 'feedback':
+        return this.processFeedbackJob(payload as {
+          taskId: string;
+          rating: number;
+          comments?: string;
+        });
+      default:
+        logger.warn({ type }, 'Unknown job type');
+        return null;
+    }
+  }
+
+  private async processIssueJob(payload: {
+    repo: string;
+    owner: string;
+    issueNumber: number;
+    action: string;
+  }) {
+    const { repo, owner, issueNumber, action } = payload;
+    logger.info({ repo, owner, issueNumber, action }, 'Processing issue job');
+    
+    // Delegate to issue processor
+    const task = await this.issueProcessor.processIssue(owner, repo, issueNumber, action);
+    return task;
+  }
+
+  private async processPullRequestJob(payload: {
+    repo: string;
+    owner: string;
+    prNumber: number;
+    action: string;
+  }) {
+    const { repo, owner, prNumber, action } = payload;
+    logger.info({ repo, owner, prNumber, action }, 'Processing pull request job');
+    // PR processing logic would go here
+    return { processed: true };
+  }
+
+  private async processFeedbackJob(payload: {
+    taskId: string;
+    rating: number;
+    comments?: string;
+  }) {
+    const { taskId, rating, comments } = payload;
+    logger.info({ taskId, rating }, 'Processing feedback job');
+    this.feedbackService.recordFeedback(taskId, rating, comments);
+    return { recorded: true };
+  }
+
+  /**
+   * Update queue metrics
+   */
+  private async updateQueueMetrics(): Promise<void> {
+    if (!this.queueService) return;
+    
+    try {
+      const counts = await this.queueService.getJobCounts();
+      metricsService.setQueueDepth('waiting', counts.waiting);
+      metricsService.setQueueDepth('active', counts.active);
+      metricsService.setQueueDepth('completed', counts.completed);
+      metricsService.setQueueDepth('failed', counts.failed);
+      metricsService.setQueueDepth('delayed', counts.delayed);
+    } catch (error) {
+      logger.error({ error }, 'Failed to update queue metrics');
+    }
+  }
+
+  /**
+   * Stop the server with graceful shutdown
    */
   async stop(): Promise<void> {
-    logger.info('Stopping XORNG Automation Server');
+    if (this.isShuttingDown) {
+      logger.warn('Shutdown already in progress');
+      return;
+    }
+    
+    this.isShuttingDown = true;
+    logger.info('Initiating graceful shutdown of XORNG Automation Server...');
+    
+    const shutdownTimeout = 30000; // 30 second timeout
+    const shutdownPromise = this.performGracefulShutdown();
+    
+    try {
+      await Promise.race([
+        shutdownPromise,
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Shutdown timeout')), shutdownTimeout)
+        ),
+      ]);
+      logger.info('XORNG Automation Server stopped gracefully');
+    } catch (error) {
+      logger.error({ error }, 'Forced shutdown due to timeout');
+      // Force exit after logging
+      process.exit(1);
+    }
+  }
+
+  private async performGracefulShutdown(): Promise<void> {
+    // 1. Stop accepting new work
+    logger.info('Stopping periodic tasks...');
+    for (const interval of this.cleanupIntervals) {
+      clearInterval(interval);
+    }
+    this.cleanupIntervals = [];
+
+    // 2. Stop service orchestrator
     if (this.serviceOrchestrator) {
+      logger.info('Stopping service orchestrator...');
       this.serviceOrchestrator.stop();
     }
+
+    // 3. Stop webhook server (stop accepting new requests)
+    logger.info('Stopping webhook server...');
     await this.webhookServer.stop();
-    logger.info('XORNG Automation Server stopped');
+
+    // 4. Wait for queue to drain active jobs
+    if (this.queueService) {
+      logger.info('Draining job queue...');
+      try {
+        await this.queueService.close();
+        logger.info('Job queue drained and closed');
+      } catch (error) {
+        logger.error({ error }, 'Error closing queue service');
+      }
+    }
+
+    // 5. Final cleanup
+    logger.info('Shutdown complete');
   }
 
   /**
@@ -386,6 +639,7 @@ export class AutomationServer {
       feedbackService: this.feedbackService,
       serviceOrchestrator: this.serviceOrchestrator,
       aiService: this.aiService,
+      queueService: this.queueService,
     };
   }
 

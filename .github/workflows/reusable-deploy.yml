@@ -1,0 +1,158 @@
+# Reusable workflow for deploying to VServer via SSH
+name: Reusable Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment (staging/production)'
+        required: true
+        type: string
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        type: string
+      compose_file:
+        description: 'Docker compose file path'
+        required: false
+        type: string
+        default: 'docker-compose.yml'
+      health_check_url:
+        description: 'URL for health check'
+        required: false
+        type: string
+        default: '/health'
+      health_check_timeout:
+        description: 'Health check timeout in seconds'
+        required: false
+        type: number
+        default: 120
+    secrets:
+      vserver_host:
+        required: true
+      vserver_user:
+        required: true
+      vserver_ssh_key:
+        required: true
+      vserver_port:
+        required: false
+      github_token:
+        required: true
+      webhook_secret:
+        required: false
+      gh_org:
+        required: false
+      openrouter_api_key:
+        required: false
+      openrouter_model:
+        required: false
+      automation_domain:
+        required: false
+      acme_email:
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Copy deployment files to VServer
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.vserver_host }}
+          username: ${{ secrets.vserver_user }}
+          key: ${{ secrets.vserver_ssh_key }}
+          port: ${{ secrets.vserver_port || 22 }}
+          source: "${{ inputs.compose_file }},traefik-dynamic.yml"
+          target: "/opt/xorng"
+
+      - name: Deploy via Docker Compose
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          AUTOMATION_IMAGE: ${{ inputs.image_tag }}
+          GITHUB_TOKEN: ${{ secrets.github_token }}
+          WEBHOOK_SECRET: ${{ secrets.webhook_secret }}
+          GH_ORG: ${{ secrets.gh_org || 'XORNG' }}
+          OPENROUTER_API_KEY: ${{ secrets.openrouter_api_key }}
+          OPENROUTER_MODEL: ${{ secrets.openrouter_model || 'anthropic/claude-sonnet-4' }}
+          AUTOMATION_DOMAIN: ${{ secrets.automation_domain }}
+          ACME_EMAIL: ${{ secrets.acme_email }}
+        with:
+          host: ${{ secrets.vserver_host }}
+          username: ${{ secrets.vserver_user }}
+          key: ${{ secrets.vserver_ssh_key }}
+          port: ${{ secrets.vserver_port || 22 }}
+          envs: AUTOMATION_IMAGE,GITHUB_TOKEN,WEBHOOK_SECRET,GH_ORG,OPENROUTER_API_KEY,OPENROUTER_MODEL,AUTOMATION_DOMAIN,ACME_EMAIL
+          script: |
+            cd /opt/xorng
+            
+            # Determine compose profiles
+            COMPOSE_PROFILES=""
+            if [ -n "$AUTOMATION_DOMAIN" ]; then
+              COMPOSE_PROFILES="--profile with-domain"
+            fi
+            
+            # Export environment variables
+            export AUTOMATION_IMAGE="$AUTOMATION_IMAGE"
+            export GITHUB_TOKEN="$GITHUB_TOKEN"
+            export WEBHOOK_SECRET="$WEBHOOK_SECRET"
+            export GH_ORG="$GH_ORG"
+            export OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
+            export OPENROUTER_MODEL="$OPENROUTER_MODEL"
+            export AUTOMATION_DOMAIN="$AUTOMATION_DOMAIN"
+            export ACME_EMAIL="$ACME_EMAIL"
+            export WEBHOOK_URL="https://${AUTOMATION_DOMAIN}/webhook/github"
+            
+            # Pull latest images
+            docker compose $COMPOSE_PROFILES pull
+            
+            # Deploy with zero-downtime (if possible)
+            docker compose $COMPOSE_PROFILES up -d --remove-orphans
+            
+            # Clean up old images
+            docker image prune -f
+
+      - name: Wait for service health
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.vserver_host }}
+          username: ${{ secrets.vserver_user }}
+          key: ${{ secrets.vserver_ssh_key }}
+          port: ${{ secrets.vserver_port || 22 }}
+          command_timeout: ${{ inputs.health_check_timeout }}m
+          script: |
+            echo "Waiting for service to be healthy..."
+            RETRIES=0
+            MAX_RETRIES=30
+            HEALTH_URL="http://localhost:3000${{ inputs.health_check_url }}"
+            
+            while [ $RETRIES -lt $MAX_RETRIES ]; do
+              if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+                echo "Service is healthy!"
+                exit 0
+              fi
+              RETRIES=$((RETRIES + 1))
+              echo "Attempt $RETRIES/$MAX_RETRIES - waiting..."
+              sleep 5
+            done
+            
+            echo "Health check failed after $MAX_RETRIES attempts"
+            docker compose logs --tail=50 automation-server
+            exit 1
+
+      - name: Deployment summary
+        run: |
+          echo "### Deployment Complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ inputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Host:** ${{ secrets.vserver_host }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ secrets.automation_domain }}" ]; then
+            echo "**URL:** https://${{ secrets.automation_domain }}" >> $GITHUB_STEP_SUMMARY
+          fi
