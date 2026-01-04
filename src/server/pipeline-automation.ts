@@ -23,6 +23,12 @@ import {
 import { MergeApprovalService, type MergeApprovalConfig } from './merge-approval.js';
 import { AIService } from './ai-service.js';
 import type { WebhookServer, GitHubWebhookPayload } from './webhook-server.js';
+import { 
+  StatePersistence, 
+  createStatePersistence,
+  type PersistedFixAttempt,
+  type PersistedAnalysis,
+} from '../utils/state-persistence.js';
 
 /**
  * Pipeline Automation configuration
@@ -39,6 +45,9 @@ export interface PipelineAutomationConfig {
   
   /** Webhook server to subscribe to events */
   webhookServer: WebhookServer;
+  
+  /** Redis URL for state persistence (restart-safe state) */
+  redisUrl?: string;
   
   /** Learning service for self-improvement (from @xorng/core) */
   learningService?: LearningServiceInterface;
@@ -169,14 +178,19 @@ export class PipelineAutomation extends EventEmitter {
   private botUsername: string;
   private enableAutoFix: boolean;
   private enableMergeApproval: boolean;
+  private organization: string;
   
-  /** Track fix attempts per PR */
+  /** Redis-backed state persistence (restart-safe) */
+  private statePersistence?: StatePersistence;
+  private redisUrl?: string;
+  
+  /** In-memory fallback - Track fix attempts per PR (deprecated, use statePersistence) */
   private fixAttempts: Map<string, FixAttemptRecord> = new Map();
   
-  /** Track applied analyses for learning from success */
+  /** In-memory fallback - Track applied analyses (deprecated, use statePersistence) */
   private appliedAnalyses: Map<string, PipelineFailureAnalysis[]> = new Map();
   
-  /** Repository locks - only one PR can be fixed at a time per repo */
+  /** In-memory fallback - Repository locks (deprecated, use statePersistence) */
   private repoLocks: Map<string, RepositoryLock> = new Map();
   
   /** Statistics */
@@ -204,6 +218,8 @@ export class PipelineAutomation extends EventEmitter {
     this.enableAutoFix = config.enableAutoFix ?? true;
     this.enableMergeApproval = config.enableMergeApproval ?? true;
     this.learningService = config.learningService;
+    this.organization = config.organization;
+    this.redisUrl = config.redisUrl;
     
     // Initialize services with proper config
     this.pipelineMonitor = new PipelineMonitor({
@@ -234,7 +250,43 @@ export class PipelineAutomation extends EventEmitter {
       enableMergeApproval: this.enableMergeApproval,
       botUsername: this.botUsername,
       learningServiceEnabled: !!config.learningService,
-    }, 'Pipeline automation initialized');
+      redisEnabled: !!config.redisUrl,
+    }, 'Pipeline automation initialized (call initialize() to setup state persistence)');
+  }
+
+  /**
+   * Initialize state persistence (must be called after constructor)
+   * This loads persisted state from Redis to survive restarts
+   */
+  async initialize(): Promise<void> {
+    if (this.redisUrl) {
+      try {
+        this.statePersistence = await createStatePersistence({
+          redisUrl: this.redisUrl,
+          keyPrefix: 'xorng:automation:',
+          logLevel: this.logger.level,
+        });
+        
+        // Load persisted state into in-memory maps for backward compatibility
+        const fixAttempts = await this.statePersistence.getAllFixAttempts();
+        const repoLocks = await this.statePersistence.getAllRepoLocks();
+        
+        this.logger.info({
+          fixAttempts: fixAttempts.size,
+          repoLocks: repoLocks.size,
+          redisConnected: this.statePersistence.isConnected(),
+        }, 'State persistence initialized, loaded persisted state');
+        
+        this.emit('persistence:ready', { 
+          fixAttempts: fixAttempts.size,
+          repoLocks: repoLocks.size,
+        });
+      } catch (error) {
+        this.logger.error({ error }, 'Failed to initialize state persistence, using in-memory fallback');
+      }
+    } else {
+      this.logger.warn('No Redis URL configured, state will not persist across restarts');
+    }
   }
 
   /**
@@ -272,24 +324,36 @@ export class PipelineAutomation extends EventEmitter {
    */
   private setupServiceHandlers(): void {
     // Handle pipeline monitor events
-    this.pipelineMonitor.on('fix:applied', (data) => {
+    this.pipelineMonitor.on('fix:applied', async (data) => {
       this.stats.fixesAttempted++;
-      this.recordFixAttempt(data.repo, data.prNumber, true);
+      await this.recordFixAttempt(data.repo, data.prNumber, true);
       
-      // Store analyses for learning when fix succeeds
+      // Store analyses for learning when fix succeeds (persist to Redis)
       if (data.analyses) {
         const prKey = `${data.owner}/${data.repo}#${data.prNumber}`;
         this.appliedAnalyses.set(prKey, data.analyses);
+        
+        // Also persist analyses to Redis
+        if (this.statePersistence) {
+          const persistedAnalyses = data.analyses.map((a: PipelineFailureAnalysis) => ({
+            category: a.failureType,
+            severity: a.autoFixable ? 'auto-fixable' : 'manual',
+            description: a.errorMessages.slice(0, 3).join('; '),
+            file: a.affectedFiles[0],
+            appliedAt: new Date().toISOString(),
+          }));
+          await this.statePersistence.setAppliedAnalyses(prKey, persistedAnalyses);
+        }
       }
       
       this.emit('fix:applied', data);
     });
     
-    this.pipelineMonitor.on('fix:failed', (data) => {
+    this.pipelineMonitor.on('fix:failed', async (data) => {
       this.stats.fixesAttempted++;
-      this.recordFixAttempt(data.repo, data.prNumber, false, data.error);
+      await this.recordFixAttempt(data.repo, data.prNumber, false, data.error);
       // Release lock and process next queued PR when fix fails
-      this.releaseRepoLock(data.repo, data.prNumber);
+      await this.releaseRepoLock(data.repo, data.prNumber);
       this.processNextQueuedPR(data.owner, data.repo);
       this.emit('fix:failed', data);
     });
@@ -299,7 +363,7 @@ export class PipelineAutomation extends EventEmitter {
     // 1. No auto-fixable issues are found
     // 2. Validator pre-check fails
     // 3. Auto-fix is disabled
-    this.pipelineMonitor.on('analysis:complete', (data) => {
+    this.pipelineMonitor.on('analysis:complete', async (data) => {
       this.logger.info({
         owner: data.owner,
         repo: data.repo,
@@ -308,7 +372,7 @@ export class PipelineAutomation extends EventEmitter {
       }, 'Analysis complete, releasing lock');
       
       // Release lock and process next queued PR
-      this.releaseRepoLock(data.repo, data.prNumber);
+      await this.releaseRepoLock(data.repo, data.prNumber);
       this.processNextQueuedPR(data.owner, data.repo);
     });
     
@@ -353,11 +417,14 @@ export class PipelineAutomation extends EventEmitter {
         }
       }
       
-      // Clean up stored analyses
+      // Clean up stored analyses (both in-memory and Redis)
       this.appliedAnalyses.delete(prKey);
+      if (this.statePersistence) {
+        await this.statePersistence.deleteAppliedAnalyses(prKey);
+      }
       
       // Release lock and process next queued PR after successful fix
-      this.releaseRepoLock(data.repo, data.prNumber);
+      await this.releaseRepoLock(data.repo, data.prNumber);
       this.processNextQueuedPR(data.owner, data.repo);
       
       this.emit('fix:successful', data);
@@ -379,12 +446,15 @@ export class PipelineAutomation extends EventEmitter {
       this.emit('merge:approved', data);
     });
     
-    this.mergeApprovalService.on('pr:merged', (data) => {
+    this.mergeApprovalService.on('pr:merged', async (data) => {
       this.stats.mergesCompleted++;
       // Clean up fix attempts record, applied analyses, and release lock
-      this.clearFixAttempts(data.repo, data.prNumber);
+      await this.clearFixAttempts(data.repo, data.prNumber);
       this.appliedAnalyses.delete(`${data.owner}/${data.repo}#${data.prNumber}`);
-      this.releaseRepoLock(data.repo, data.prNumber);
+      if (this.statePersistence) {
+        await this.statePersistence.deleteAppliedAnalyses(`${data.owner}/${data.repo}#${data.prNumber}`);
+      }
+      await this.releaseRepoLock(data.repo, data.prNumber);
       this.emit('merge:completed', data);
       
       // Process next queued PR for this repo
@@ -426,7 +496,7 @@ export class PipelineAutomation extends EventEmitter {
     // Process each associated PR
     for (const pr of checkRun.pull_requests || []) {
       // Check if auto-fix is enabled and attempts available
-      if (!this.enableAutoFix || !this.canAttemptFix(context.repo, pr.number)) {
+      if (!this.enableAutoFix || !(await this.canAttemptFix(context.repo, pr.number))) {
         this.logger.info({
           owner: context.owner,
           repo: context.repo,
@@ -444,21 +514,22 @@ export class PipelineAutomation extends EventEmitter {
       }
       
       // Try to acquire lock for this repo - only one PR can be fixed at a time
-      const lockAcquired = this.tryAcquireRepoLock(context.owner, context.repo, pr.number);
+      const lockAcquired = await this.tryAcquireRepoLock(context.owner, context.repo, pr.number);
       
       if (!lockAcquired) {
+        const activePR = await this.getActiveFixPR(context.repo);
         this.logger.info({
           owner: context.owner,
           repo: context.repo,
           prNumber: pr.number,
-          activePR: this.getActiveFixPR(context.repo),
+          activePR,
         }, 'Another PR is being fixed in this repo, queueing this PR');
         
         await this.notifyPRQueued({
           owner: context.owner,
           repo: context.repo,
           prNumber: pr.number,
-          activePR: this.getActiveFixPR(context.repo)!,
+          activePR: activePR!,
         });
         continue;
       }
@@ -489,7 +560,7 @@ export class PipelineAutomation extends EventEmitter {
       } catch (error) {
         this.logger.error({ error, owner: context.owner, repo: context.repo, prNumber: pr.number }, 'Failed to process check run');
         // Release lock on error so other PRs can be processed
-        this.releaseRepoLock(context.repo, pr.number);
+        await this.releaseRepoLock(context.repo, pr.number);
         this.processNextQueuedPR(context.owner, context.repo);
       }
     }
@@ -554,7 +625,7 @@ export class PipelineAutomation extends EventEmitter {
     for (const pr of workflowRun.pull_requests || []) {
       if (workflowRun.conclusion === 'failure') {
         // Check if auto-fix is enabled and attempts available
-        if (!this.enableAutoFix || !this.canAttemptFix(context.repo, pr.number)) {
+        if (!this.enableAutoFix || !(await this.canAttemptFix(context.repo, pr.number))) {
           await this.requestHumanIntervention({
             owner: context.owner,
             repo: context.repo,
@@ -566,21 +637,22 @@ export class PipelineAutomation extends EventEmitter {
         }
         
         // Try to acquire lock for this repo - only one PR can be fixed at a time
-        const lockAcquired = this.tryAcquireRepoLock(context.owner, context.repo, pr.number);
+        const lockAcquired = await this.tryAcquireRepoLock(context.owner, context.repo, pr.number);
         
         if (!lockAcquired) {
+          const activePR = await this.getActiveFixPR(context.repo);
           this.logger.info({
             owner: context.owner,
             repo: context.repo,
             prNumber: pr.number,
-            activePR: this.getActiveFixPR(context.repo),
+            activePR,
           }, 'Another PR is being fixed in this repo, queueing this PR');
           
           await this.notifyPRQueued({
             owner: context.owner,
             repo: context.repo,
             prNumber: pr.number,
-            activePR: this.getActiveFixPR(context.repo)!,
+            activePR: activePR!,
           });
           continue;
         }
@@ -604,11 +676,11 @@ export class PipelineAutomation extends EventEmitter {
           });
         } catch (error) {
           this.logger.error({ error, owner: context.owner, repo: context.repo, prNumber: pr.number }, 'Failed to process workflow run');
-          this.releaseRepoLock(context.repo, pr.number);
+          await this.releaseRepoLock(context.repo, pr.number);
         }
       } else if (workflowRun.conclusion === 'success' && this.enableMergeApproval) {
         // Release lock if this PR's fix was successful
-        this.releaseRepoLock(context.repo, pr.number);
+        await this.releaseRepoLock(context.repo, pr.number);
         
         // Check if ALL checks are now passing
         const status = await this.pipelineMonitor.getPRPipelineStatus(
@@ -701,7 +773,7 @@ export class PipelineAutomation extends EventEmitter {
     
     // Reset fix attempts when PR is synchronized (new commits pushed)
     if (action === 'synchronize') {
-      this.resetFixAttempts(context.repo, pr.number);
+      await this.resetFixAttempts(context.repo, pr.number);
       this.logger.info({
         ...context,
         prNumber: pr.number,
@@ -710,9 +782,9 @@ export class PipelineAutomation extends EventEmitter {
     
     // Clean up when PR is closed/merged
     if (action === 'closed') {
-      this.clearFixAttempts(context.repo, pr.number);
+      await this.clearFixAttempts(context.repo, pr.number);
       // Release lock and process next queued PR
-      this.releaseRepoLock(context.repo, pr.number);
+      await this.releaseRepoLock(context.repo, pr.number);
       this.processNextQueuedPR(context.owner, context.repo);
     }
   }
@@ -731,10 +803,10 @@ export class PipelineAutomation extends EventEmitter {
     }, 'Processing manual autofix request');
     
     // Try to acquire lock for manual request
-    const lockAcquired = this.tryAcquireRepoLock(data.owner, data.repo, data.prNumber);
+    const lockAcquired = await this.tryAcquireRepoLock(data.owner, data.repo, data.prNumber);
     
     if (!lockAcquired) {
-      const activePR = this.getActiveFixPR(data.repo);
+      const activePR = await this.getActiveFixPR(data.repo);
       await this.upsertComment(data.owner, data.repo, data.prNumber,
         `@${data.requester} Cannot start auto-fix right now. PR #${activePR} is currently being fixed in this repository.\n\nYour request has been queued and will be processed after PR #${activePR} is merged or its fix completes.`,
         PipelineAutomation.COMMENT_MARKERS.QUEUE_STATUS
@@ -743,7 +815,7 @@ export class PipelineAutomation extends EventEmitter {
     }
     
     // Reset fix attempts for manual request
-    this.resetFixAttempts(data.repo, data.prNumber);
+    await this.resetFixAttempts(data.repo, data.prNumber);
     
     // Get current pipeline status
     const status = await this.pipelineMonitor.getPRPipelineStatus(
@@ -816,8 +888,8 @@ _Only users with write access can use these commands._`;
   }): Promise<void> {
     const { owner, repo, prNumber, reason, failedCheck, failedWorkflow } = params;
     
-    // Get fix attempt history
-    const attempts = this.getFixAttempts(repo, prNumber);
+    // Get fix attempt history (now async)
+    const attempts = await this.getFixAttempts(repo, prNumber);
     
     // Create a learning issue to track this failure for future improvement
     const learningIssueUrl = await this.createLearningIssue(params);
@@ -1344,33 +1416,58 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
 
   /**
    * Check if we can attempt another fix
+   * Uses persistent state if available, falls back to in-memory
    */
-  private canAttemptFix(repo: string, prNumber: number): boolean {
+  private async canAttemptFix(repo: string, prNumber: number): Promise<boolean> {
     const key = `${repo}#${prNumber}`;
-    const record = this.fixAttempts.get(key);
     
-    if (!record) {
-      return true;
+    if (this.statePersistence) {
+      const persisted = await this.statePersistence.getFixAttempts(key);
+      if (!persisted) return true;
+      return persisted.attempts < 3;
     }
     
+    // In-memory fallback
+    const record = this.fixAttempts.get(key);
+    if (!record) return true;
     return record.attempts < 3;
   }
 
   /**
    * Get fix attempts for a PR
+   * Uses persistent state if available, falls back to in-memory
    */
-  private getFixAttempts(repo: string, prNumber: number): FixAttemptRecord | undefined {
+  private async getFixAttempts(repo: string, prNumber: number): Promise<FixAttemptRecord | undefined> {
     const key = `${repo}#${prNumber}`;
+    
+    if (this.statePersistence) {
+      const persisted = await this.statePersistence.getFixAttempts(key);
+      if (persisted) {
+        return {
+          prNumber,
+          repo,
+          attempts: persisted.attempts,
+          lastAttempt: new Date(persisted.lastAttempt),
+          lastError: persisted.lastError,
+          successful: false, // Will be updated on next attempt
+        };
+      }
+      return undefined;
+    }
+    
+    // In-memory fallback
     return this.fixAttempts.get(key);
   }
 
   /**
    * Record a fix attempt
+   * Persists to Redis if available, also updates in-memory map
    */
-  private recordFixAttempt(repo: string, prNumber: number, successful: boolean, error?: string): void {
+  private async recordFixAttempt(repo: string, prNumber: number, successful: boolean, error?: string): Promise<void> {
     const key = `${repo}#${prNumber}`;
-    const existing = this.fixAttempts.get(key);
     
+    // Update in-memory
+    const existing = this.fixAttempts.get(key);
     if (existing) {
       existing.attempts++;
       existing.lastAttempt = new Date();
@@ -1387,25 +1484,45 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
       });
     }
     
+    // Persist to Redis
+    if (this.statePersistence) {
+      const attemptCount = existing ? existing.attempts : 1;
+      await this.statePersistence.setFixAttempts(key, {
+        attempts: attemptCount,
+        lastAttempt: new Date().toISOString(),
+        lastError: error,
+      });
+    }
+    
     if (successful) {
       this.stats.fixesSuccessful++;
     }
   }
 
   /**
-   * Reset fix attempts for a PR
+   * Reset fix attempts for a PR (for retry requests)
+   * Persists to Redis if available
    */
-  private resetFixAttempts(repo: string, prNumber: number): void {
+  private async resetFixAttempts(repo: string, prNumber: number): Promise<void> {
     const key = `${repo}#${prNumber}`;
     this.fixAttempts.delete(key);
+    
+    if (this.statePersistence) {
+      await this.statePersistence.resetFixAttempts(key);
+    }
   }
 
   /**
-   * Clear fix attempts for a PR
+   * Clear fix attempts for a PR (on merge/close)
+   * Persists to Redis if available
    */
-  private clearFixAttempts(repo: string, prNumber: number): void {
+  private async clearFixAttempts(repo: string, prNumber: number): Promise<void> {
     const key = `${repo}#${prNumber}`;
     this.fixAttempts.delete(key);
+    
+    if (this.statePersistence) {
+      await this.statePersistence.deleteFixAttempts(key);
+    }
   }
 
   // ==========================================================================
@@ -1415,11 +1532,53 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
   /**
    * Try to acquire a lock for auto-fixing a PR in a repository.
    * Only one PR can be fixed at a time per repository to prevent merge conflicts.
+   * Uses persistent state if available.
    * 
    * @returns true if lock was acquired, false if another PR is being fixed
    */
-  private tryAcquireRepoLock(owner: string, repo: string, prNumber: number): boolean {
+  private async tryAcquireRepoLock(owner: string, repo: string, prNumber: number): Promise<boolean> {
     const key = `${owner}/${repo}`;
+    
+    // Try persistent lock first
+    if (this.statePersistence) {
+      const acquired = await this.statePersistence.tryAcquireRepoLock(key, owner, prNumber);
+      if (!acquired) {
+        // Check if we need to add to local queue
+        const lockedPR = await this.statePersistence.getLockedPR(key);
+        if (lockedPR && lockedPR !== prNumber) {
+          // Manage queue in memory (queue logic is complex for Redis)
+          const existing = this.repoLocks.get(key);
+          if (existing) {
+            const alreadyQueued = existing.queue.some(q => q.prNumber === prNumber);
+            if (!alreadyQueued) {
+              existing.queue.push({ prNumber, owner, queuedAt: new Date() });
+              this.stats.prsQueued++;
+              this.logger.info({ owner, repo, prNumber, activePR: lockedPR, queueLength: existing.queue.length }, 'PR queued for auto-fix');
+            }
+          } else {
+            // Create local queue entry
+            this.repoLocks.set(key, {
+              activePR: lockedPR,
+              lockedAt: new Date(),
+              queue: [{ prNumber, owner, queuedAt: new Date() }],
+            });
+            this.stats.prsQueued++;
+            this.logger.info({ owner, repo, prNumber, activePR: lockedPR }, 'PR queued for auto-fix');
+          }
+          return false;
+        }
+      }
+      // Also update local map
+      this.repoLocks.set(key, {
+        activePR: prNumber,
+        lockedAt: new Date(),
+        queue: this.repoLocks.get(key)?.queue || [],
+      });
+      this.logger.info({ owner, repo, prNumber }, 'Acquired repo lock for auto-fix');
+      return acquired;
+    }
+    
+    // In-memory fallback
     const existing = this.repoLocks.get(key);
     
     if (existing) {
@@ -1467,12 +1626,23 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
 
   /**
    * Release the lock for a repository
+   * Uses persistent state if available
    */
-  private releaseRepoLock(repo: string, prNumber: number): void {
-    // Find the lock by repo name (may need to search)
+  private async releaseRepoLock(repo: string, prNumber: number): Promise<void> {
+    // Find the lock by repo name
     for (const [key, lock] of this.repoLocks.entries()) {
       if (key.endsWith(`/${repo}`) && lock.activePR === prNumber) {
-        this.repoLocks.delete(key);
+        // Release from persistent storage first
+        if (this.statePersistence) {
+          await this.statePersistence.releaseRepoLock(key, prNumber);
+        }
+        
+        // Only delete from local map if no queue
+        // Queue needs to be kept for processNextQueuedPR
+        if (lock.queue.length === 0) {
+          this.repoLocks.delete(key);
+        }
+        
         this.logger.info({
           repo,
           prNumber,
@@ -1485,8 +1655,17 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
 
   /**
    * Get the PR currently being fixed in a repository
+   * Uses persistent state if available
    */
-  private getActiveFixPR(repo: string): number | null {
+  private async getActiveFixPR(repo: string): Promise<number | null> {
+    // Check persistent storage first
+    if (this.statePersistence) {
+      const key = `${this.organization}/${repo}`;
+      const lockedPR = await this.statePersistence.getLockedPR(key);
+      if (lockedPR) return lockedPR;
+    }
+    
+    // Fall back to in-memory
     for (const [key, lock] of this.repoLocks.entries()) {
       if (key.endsWith(`/${repo}`)) {
         return lock.activePR;
@@ -1505,6 +1684,10 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
     if (!lock || lock.queue.length === 0) {
       // No queued PRs, remove the lock entry
       this.repoLocks.delete(key);
+      if (this.statePersistence) {
+        // Note: We don't pass prNumber here since we're just cleaning up
+        // The persistent lock should already be released
+      }
       return;
     }
     
@@ -1522,6 +1705,15 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
     lock.activePR = next.prNumber;
     lock.lockedAt = new Date();
     
+    // Update persistent lock
+    if (this.statePersistence) {
+      await this.statePersistence.setRepoLock(key, {
+        prNumber: next.prNumber,
+        owner,
+        acquiredAt: new Date().toISOString(),
+      });
+    }
+    
     // Notify the PR that it's now being processed
     await this.upsertComment(owner, repo, next.prNumber,
       `🔄 Your PR is now being processed for auto-fix. It was queued at ${next.queuedAt.toISOString()}.`,
@@ -1536,7 +1728,7 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
         await this.pipelineMonitor.handlePRPipelineFailure(owner, repo, next.prNumber);
       } else {
         // PR might have been fixed manually or checks now pass
-        this.releaseRepoLock(repo, next.prNumber);
+        await this.releaseRepoLock(repo, next.prNumber);
         await this.upsertComment(owner, repo, next.prNumber,
           `✅ Pipeline checks are now passing! No auto-fix needed.`,
           PipelineAutomation.COMMENT_MARKERS.AUTO_FIX
@@ -1546,7 +1738,7 @@ ${newInfo.failedWorkflow ? `- **Failed Workflow:** ${newInfo.failedWorkflow}` : 
       }
     } catch (error) {
       this.logger.error({ error, owner, repo, prNumber: next.prNumber }, 'Failed to process queued PR');
-      this.releaseRepoLock(repo, next.prNumber);
+      await this.releaseRepoLock(repo, next.prNumber);
       this.processNextQueuedPR(owner, repo);
     }
   }
@@ -1608,7 +1800,7 @@ _This ensures clean git history and prevents conflicting automated changes._`;
       return;
     }
     
-    if (!this.canAttemptFix(repo, prNumber)) {
+    if (!(await this.canAttemptFix(repo, prNumber))) {
       this.logger.info({
         owner,
         repo,
@@ -1618,14 +1810,15 @@ _This ensures clean git history and prevents conflicting automated changes._`;
     }
     
     // Try to acquire lock for this repo
-    const lockAcquired = this.tryAcquireRepoLock(owner, repo, prNumber);
+    const lockAcquired = await this.tryAcquireRepoLock(owner, repo, prNumber);
     
     if (!lockAcquired) {
+      const activePR = await this.getActiveFixPR(repo);
       this.logger.info({
         owner,
         repo,
         prNumber,
-        activePR: this.getActiveFixPR(repo),
+        activePR,
       }, 'Another PR is being fixed in this repo, scanner-triggered PR queued');
       return;
     }
@@ -1656,7 +1849,7 @@ _This ensures clean git history and prevents conflicting automated changes._`;
           repo,
           prNumber,
         }, 'No failed checks found during scanner analysis - PR may have been fixed');
-        this.releaseRepoLock(repo, prNumber);
+        await this.releaseRepoLock(repo, prNumber);
         this.processNextQueuedPR(owner, repo);
         return;
       }
@@ -1685,7 +1878,7 @@ _This ensures clean git history and prevents conflicting automated changes._`;
         repo,
         prNumber,
       }, 'Failed to trigger PR analysis from scanner');
-      this.releaseRepoLock(repo, prNumber);
+      await this.releaseRepoLock(repo, prNumber);
       this.processNextQueuedPR(owner, repo);
       throw error;
     }
@@ -1890,11 +2083,13 @@ Please create the repository manually.`,
     prsQueued: number;
     activeFixAttempts: number;
     lockedRepos: number;
+    persistenceConnected: boolean;
   } {
     return {
       ...this.stats,
       activeFixAttempts: this.fixAttempts.size,
       lockedRepos: this.repoLocks.size,
+      persistenceConnected: this.statePersistence?.isConnected() ?? false,
     };
   }
 
@@ -1906,6 +2101,7 @@ Please create the repository manually.`,
     services: {
       pipelineMonitor: boolean;
       mergeApproval: boolean;
+      statePersistence: boolean;
     };
     stats: ReturnType<PipelineAutomation['getStats']>;
     locks: Array<{ repo: string; activePR: number; queueLength: number }>;
@@ -1924,9 +2120,23 @@ Please create the repository manually.`,
       services: {
         pipelineMonitor: this.enableAutoFix,
         mergeApproval: this.enableMergeApproval,
+        statePersistence: this.statePersistence?.isConnected() ?? false,
       },
       stats: this.getStats(),
       locks,
     };
+  }
+
+  /**
+   * Gracefully shutdown the automation service
+   */
+  async shutdown(): Promise<void> {
+    this.logger.info('Shutting down pipeline automation');
+    
+    if (this.statePersistence) {
+      await this.statePersistence.close();
+    }
+    
+    this.removeAllListeners();
   }
 }
