@@ -9,10 +9,13 @@ services:
     restart: unless-stopped
     profiles:
       - with-domain  # Only starts when profile is active
+    environment:
+      # Force Docker API version compatibility with host
+      - DOCKER_API_VERSION=1.44
     command:
       # API and Dashboard (for debugging)
       - "--api.insecure=true"
-      - "--log.level=${LOG_LEVEL:-INFO}"
+      - "--log.level=DEBUG"
       # Docker provider
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"

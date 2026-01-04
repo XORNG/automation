@@ -135,8 +135,21 @@ jobs:
               # Add webhook URL to .env
               echo "WEBHOOK_URL=https://${DOMAIN}/webhook/github" >> .env
               
-              # Deploy with Traefik profile
-              docker compose --profile with-domain up -d --remove-orphans
+              # Debug: Show network and container state before deployment
+              echo "=== Debug: Docker Networks ==="
+              docker network ls
+              
+              # Force recreate containers to pick up new labels
+              docker compose --profile with-domain down
+              docker compose --profile with-domain up -d --force-recreate
+              
+              # Debug: Show container labels
+              echo "=== Debug: Container labels ==="
+              docker inspect xorng-automation --format '{{json .Config.Labels}}' | jq . || true
+              
+              # Debug: Show networks
+              echo "=== Debug: Container networks ==="
+              docker inspect xorng-automation --format '{{json .NetworkSettings.Networks}}' | jq . || true
             else
               echo "=========================================="
               echo "Deploying WITHOUT domain"
@@ -182,7 +195,13 @@ jobs:
               
               if [ $i -eq $MAX_RETRIES ]; then
                 echo "❌ Health check failed after $MAX_RETRIES attempts"
+                echo "=== XORNG Automation Logs ==="
                 docker logs xorng-automation --tail 50
+                echo "=== Traefik Logs ==="
+                docker logs traefik --tail 100 2>&1 || true
+                echo "=== Network Status ==="
+                docker network ls
+                docker network inspect xorng-network 2>&1 || true
                 exit 1
               fi
               
@@ -204,7 +223,7 @@ jobs:
           script: |
             cd /opt/xorng
             
-            echo "=== Container Status ==="
+            echo "=== Container Status ===""
             docker compose ps
             
             echo ""
