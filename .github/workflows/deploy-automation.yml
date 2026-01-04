@@ -19,7 +19,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/xorng-automation
+  # Note: IMAGE_NAME is set dynamically in steps to ensure lowercase
 
 jobs:
   build:
@@ -31,10 +31,16 @@ jobs:
     outputs:
       image_tag: ${{ steps.meta.outputs.tags }}
       image_digest: ${{ steps.build.outputs.digest }}
+      image_name: ${{ steps.lowercase.outputs.image_name }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set lowercase image name
+        id: lowercase
+        run: |
+          echo "image_name=${GITHUB_REPOSITORY_OWNER,,}/xorng-automation" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -50,7 +56,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ steps.lowercase.outputs.image_name }}
           tags: |
             type=sha,prefix=
             type=raw,value=latest,enable={{is_default_branch}}
@@ -107,12 +113,12 @@ jobs:
             AUTOMATION_DOMAIN=${{ secrets.AUTOMATION_DOMAIN }}
             ACME_EMAIL=${{ secrets.ACME_EMAIL }}
             LOG_LEVEL=${{ secrets.LOG_LEVEL || 'info' }}
-            AUTOMATION_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            AUTOMATION_IMAGE=${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}:latest
             EOF
             
             # Pull latest image
             echo "Pulling latest image..."
-            docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+            docker pull "${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}:latest"
             
             # Determine deployment mode
             DOMAIN="${{ secrets.AUTOMATION_DOMAIN }}"
