@@ -76,14 +76,17 @@ services:
     labels:
       # HTTPS Router
       - "traefik.enable=true"
+      - "traefik.docker.network=xorng-network"
       - "traefik.http.routers.automation.rule=Host(`${AUTOMATION_DOMAIN}`)"
       - "traefik.http.routers.automation.entrypoints=websecure"
       - "traefik.http.routers.automation.tls=true"
       - "traefik.http.routers.automation.tls.certresolver=letsencrypt"
       - "traefik.http.services.automation.loadbalancer.server.port=3000"
-      # HTTP to HTTPS redirect (at router level, not global - allows ACME challenge)
+      # HTTP Router for ACME challenge (NO redirect - required for Let's Encrypt)
       - "traefik.http.routers.automation-http.rule=Host(`${AUTOMATION_DOMAIN}`)"
       - "traefik.http.routers.automation-http.entrypoints=web"
+      - "traefik.http.routers.automation-http.service=automation"
+      # HTTP to HTTPS redirect middleware (applied AFTER ACME challenge paths)
       - "traefik.http.middlewares.automation-redirect.redirectscheme.scheme=https"
       - "traefik.http.middlewares.automation-redirect.redirectscheme.permanent=true"
       - "traefik.http.routers.automation-http.middlewares=automation-redirect"
@@ -130,3 +133,4 @@ volumes:
 networks:
   xorng-network:
     driver: bridge
+    name: xorng-network  # Explicit name prevents Docker Compose from prefixing with project name
