@@ -20,7 +20,7 @@
     "test": "vitest"
   },
   "dependencies": {
-    "@octokit/rest": "^20.0.2",
+    "@octokit/rest": "^22.0.1",
     "bullmq": "^5.1.0",
     "commander": "^12.0.0",
     "dockerode": "^4.0.2",
