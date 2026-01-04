@@ -1,18 +1,14 @@
 {
-  "name": "@xorng/automation",
-  "version": "0.1.0",
-  "description": "XORNG Framework automation and orchestration",
-  "type": "module",
-  "bin": {
-    "xorng": "./dist/index.js",
-    "xorng-server": "./dist/server/server.js"
-  },
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "start:server": "node dist/server/server.js",
-    "dev": "tsx watch src/index.ts",
-    "dev:server": "tsx watch src/server/server.ts",
+    "build": "tsc --project tsconfig.json",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0"
+  }
+}
     "docker:build": "bash scripts/docker-build.sh",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
