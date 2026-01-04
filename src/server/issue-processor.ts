@@ -2,6 +2,7 @@ import { Octokit } from '@octokit/rest';
 import { pino, type Logger } from 'pino';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
+import { AIService, type PRReviewResult, type IssueAnalysisResult } from './ai-service.js';
 
 /**
  * Issue data structure
@@ -22,6 +23,27 @@ export interface IssueData {
 }
 
 /**
+ * Pull Request data structure
+ */
+export interface PRData {
+  id: number;
+  number: number;
+  title: string;
+  body: string | null;
+  state: string;
+  author: string;
+  repository: string;
+  repositoryOwner: string;
+  htmlUrl: string;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  baseSha: string;
+  mergeable?: boolean;
+  mergeableState?: string;
+}
+
+/**
  * Processing task
  */
 export interface ProcessingTask {
@@ -29,12 +51,13 @@ export interface ProcessingTask {
   type: 'issue' | 'pr' | 'feedback';
   status: 'pending' | 'in-progress' | 'completed' | 'failed';
   priority: number;
-  data: IssueData | unknown;
+  data: IssueData | PRData | unknown;
   createdAt: string;
   updatedAt: string;
   assignedTo?: string;  // workspaceId of assigned VS Code extension
   result?: unknown;
   error?: string;
+  aiAnalysis?: IssueAnalysisResult | PRReviewResult;
 }
 
 /**
@@ -44,6 +67,11 @@ export interface IssueProcessorConfig {
   token: string;
   organization: string;
   logLevel?: string;
+  // AI Service integration (optional)
+  aiService?: AIService;
+  // Auto-merge settings
+  autoMergeEnabled?: boolean;
+  autoMergeRequireApproval?: boolean;
   // No label filtering - process all issues
   // No repository filtering - process all repositories
 }
@@ -56,12 +84,15 @@ export interface IssueProcessorConfig {
  * - Processes ALL repositories in the organization
  * - Queue-based task management for VS Code extension
  * - Event-driven architecture
+ * - AI-powered issue analysis and PR review (via OpenRouter)
+ * - PR merge capabilities with configurable auto-merge
  */
 export class IssueProcessor extends EventEmitter {
   private octokit: Octokit;
   private logger: Logger;
   private config: IssueProcessorConfig;
   private taskQueue: Map<string, ProcessingTask> = new Map();
+  private aiService?: AIService;
 
   constructor(config: IssueProcessorConfig) {
     super();
@@ -69,10 +100,23 @@ export class IssueProcessor extends EventEmitter {
     this.octokit = new Octokit({
       auth: config.token,
     });
+    this.aiService = config.aiService;
     this.logger = pino({
       level: config.logLevel || 'info',
       name: 'issue-processor',
     });
+
+    if (this.aiService?.isEnabled()) {
+      this.logger.info('AI-powered processing enabled');
+    }
+  }
+
+  /**
+   * Set or update AI service
+   */
+  setAIService(aiService: AIService): void {
+    this.aiService = aiService;
+    this.logger.info({ enabled: aiService.isEnabled() }, 'AI service configured');
   }
 
   /**
@@ -462,5 +506,423 @@ export class IssueProcessor extends EventEmitter {
     }, 'Synced all open issues');
 
     return allTasks;
+  }
+
+  // =========================================
+  // AI-Powered Processing Methods
+  // =========================================
+
+  /**
+   * Analyze an issue using AI and update the task with analysis results
+   */
+  async analyzeIssueWithAI(taskId: string): Promise<IssueAnalysisResult | null> {
+    if (!this.aiService?.isEnabled()) {
+      this.logger.warn('AI service not enabled, skipping issue analysis');
+      return null;
+    }
+
+    const task = this.taskQueue.get(taskId);
+    if (!task || task.type !== 'issue') {
+      this.logger.warn({ taskId }, 'Task not found or not an issue');
+      return null;
+    }
+
+    const issueData = task.data as IssueData;
+
+    try {
+      const analysis = await this.aiService.analyzeIssue({
+        title: issueData.title,
+        body: issueData.body,
+        labels: issueData.labels.map(l => l.name),
+        repository: `${issueData.repositoryOwner}/${issueData.repository}`,
+      });
+
+      task.aiAnalysis = analysis;
+      task.updatedAt = new Date().toISOString();
+
+      this.logger.info({
+        taskId,
+        category: analysis.category,
+        priority: analysis.priority,
+        complexity: analysis.estimatedComplexity,
+      }, 'Issue analyzed with AI');
+
+      this.emit('issue:ai-analyzed', { task, analysis });
+      return analysis;
+    } catch (error) {
+      this.logger.error({ error, taskId }, 'Failed to analyze issue with AI');
+      return null;
+    }
+  }
+
+  /**
+   * Review a PR using AI and optionally auto-merge
+   */
+  async reviewPRWithAI(taskId: string): Promise<PRReviewResult | null> {
+    if (!this.aiService?.isEnabled()) {
+      this.logger.warn('AI service not enabled, skipping PR review');
+      return null;
+    }
+
+    const task = this.taskQueue.get(taskId);
+    if (!task || task.type !== 'pr') {
+      this.logger.warn({ taskId }, 'Task not found or not a PR');
+      return null;
+    }
+
+    const prData = task.data as PRData;
+
+    try {
+      // Get PR diff from GitHub
+      const { data: diff } = await this.octokit.pulls.get({
+        owner: prData.repositoryOwner,
+        repo: prData.repository,
+        pull_number: prData.number,
+        mediaType: {
+          format: 'diff',
+        },
+      });
+
+      // Get list of changed files
+      const { data: files } = await this.octokit.pulls.listFiles({
+        owner: prData.repositoryOwner,
+        repo: prData.repository,
+        pull_number: prData.number,
+      });
+
+      const review = await this.aiService.reviewPullRequest({
+        title: prData.title,
+        body: prData.body,
+        repository: `${prData.repositoryOwner}/${prData.repository}`,
+        baseBranch: prData.baseRef,
+        headBranch: prData.headRef,
+        diff: String(diff),
+        changedFiles: files.map((f: { filename: string; patch?: string }) => ({ filename: f.filename, patch: f.patch })),
+      });
+
+      task.aiAnalysis = review;
+      task.updatedAt = new Date().toISOString();
+
+      this.logger.info({
+        taskId,
+        prNumber: prData.number,
+        approved: review.approved,
+        mergeRecommendation: review.mergeRecommendation,
+        concerns: review.concerns.length,
+      }, 'PR reviewed with AI');
+
+      this.emit('pr:ai-reviewed', { task, review });
+      return review;
+    } catch (error) {
+      this.logger.error({ error, taskId }, 'Failed to review PR with AI');
+      return null;
+    }
+  }
+
+  // =========================================
+  // PR Management Methods
+  // =========================================
+
+  /**
+   * Get details of a pull request
+   */
+  async getPullRequestDetails(owner: string, repo: string, prNumber: number): Promise<PRData | null> {
+    try {
+      const { data: pr } = await this.octokit.pulls.get({
+        owner,
+        repo,
+        pull_number: prNumber,
+      });
+
+      return {
+        id: pr.id,
+        number: pr.number,
+        title: pr.title,
+        body: pr.body,
+        state: pr.state,
+        author: pr.user?.login || 'unknown',
+        repository: repo,
+        repositoryOwner: owner,
+        htmlUrl: pr.html_url,
+        headRef: pr.head.ref,
+        headSha: pr.head.sha,
+        baseRef: pr.base.ref,
+        baseSha: pr.base.sha,
+        mergeable: pr.mergeable ?? undefined,
+        mergeableState: pr.mergeable_state,
+      };
+    } catch (error) {
+      this.logger.error({ error, owner, repo, prNumber }, 'Failed to get PR details');
+      return null;
+    }
+  }
+
+  /**
+   * Create a review on a pull request
+   */
+  async createPRReview(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    review: {
+      body: string;
+      event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
+      comments?: Array<{
+        path: string;
+        position?: number;
+        line?: number;
+        body: string;
+      }>;
+    }
+  ): Promise<boolean> {
+    try {
+      await this.octokit.pulls.createReview({
+        owner,
+        repo,
+        pull_number: prNumber,
+        body: review.body,
+        event: review.event,
+        comments: review.comments,
+      });
+
+      this.logger.info({
+        owner,
+        repo,
+        prNumber,
+        event: review.event,
+      }, 'Created PR review');
+
+      return true;
+    } catch (error) {
+      this.logger.error({ error, owner, repo, prNumber }, 'Failed to create PR review');
+      return false;
+    }
+  }
+
+  /**
+   * Merge a pull request
+   */
+  async mergePullRequest(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: {
+      commitTitle?: string;
+      commitMessage?: string;
+      mergeMethod?: 'merge' | 'squash' | 'rebase';
+    }
+  ): Promise<{ success: boolean; sha?: string; message?: string }> {
+    try {
+      // Check if PR is mergeable first
+      const prDetails = await this.getPullRequestDetails(owner, repo, prNumber);
+      
+      if (!prDetails) {
+        return { success: false, message: 'Failed to get PR details' };
+      }
+
+      if (prDetails.state !== 'open') {
+        return { success: false, message: 'PR is not open' };
+      }
+
+      if (prDetails.mergeable === false) {
+        return { success: false, message: `PR is not mergeable: ${prDetails.mergeableState}` };
+      }
+
+      const { data: result } = await this.octokit.pulls.merge({
+        owner,
+        repo,
+        pull_number: prNumber,
+        commit_title: options?.commitTitle,
+        commit_message: options?.commitMessage,
+        merge_method: options?.mergeMethod || 'squash',
+      });
+
+      this.logger.info({
+        owner,
+        repo,
+        prNumber,
+        sha: result.sha,
+        merged: result.merged,
+      }, 'Merged PR');
+
+      this.emit('pr:merged', { owner, repo, prNumber, sha: result.sha });
+
+      return { success: result.merged, sha: result.sha, message: result.message };
+    } catch (error: any) {
+      this.logger.error({ error, owner, repo, prNumber }, 'Failed to merge PR');
+      return { success: false, message: error.message || 'Unknown error' };
+    }
+  }
+
+  /**
+   * Create a comment on a PR or issue
+   */
+  async createComment(
+    owner: string,
+    repo: string,
+    issueOrPRNumber: number,
+    body: string
+  ): Promise<boolean> {
+    try {
+      await this.octokit.issues.createComment({
+        owner,
+        repo,
+        issue_number: issueOrPRNumber,
+        body,
+      });
+
+      this.logger.info({ owner, repo, number: issueOrPRNumber }, 'Created comment');
+      return true;
+    } catch (error) {
+      this.logger.error({ error, owner, repo, number: issueOrPRNumber }, 'Failed to create comment');
+      return false;
+    }
+  }
+
+  /**
+   * Add labels to an issue or PR
+   */
+  async addLabels(
+    owner: string,
+    repo: string,
+    issueOrPRNumber: number,
+    labels: string[]
+  ): Promise<boolean> {
+    try {
+      await this.octokit.issues.addLabels({
+        owner,
+        repo,
+        issue_number: issueOrPRNumber,
+        labels,
+      });
+
+      this.logger.info({ owner, repo, number: issueOrPRNumber, labels }, 'Added labels');
+      return true;
+    } catch (error) {
+      this.logger.error({ error, owner, repo, number: issueOrPRNumber }, 'Failed to add labels');
+      return false;
+    }
+  }
+
+  /**
+   * Process a PR with AI review and optional auto-merge
+   */
+  async processPRWithAutoMerge(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: {
+      requireApproval?: boolean;
+      addReviewComment?: boolean;
+      mergeOnApproval?: boolean;
+    }
+  ): Promise<{
+    reviewed: boolean;
+    merged: boolean;
+    review?: PRReviewResult;
+    error?: string;
+  }> {
+    const result: {
+      reviewed: boolean;
+      merged: boolean;
+      review?: PRReviewResult;
+      error?: string;
+    } = { reviewed: false, merged: false };
+
+    if (!this.aiService?.isEnabled()) {
+      result.error = 'AI service not enabled';
+      return result;
+    }
+
+    // Create a task for this PR
+    const prDetails = await this.getPullRequestDetails(owner, repo, prNumber);
+    if (!prDetails) {
+      result.error = 'Failed to get PR details';
+      return result;
+    }
+
+    const task = this.createTask('pr', prDetails);
+
+    // Review with AI
+    const review = await this.reviewPRWithAI(task.id);
+    if (!review) {
+      result.error = 'AI review failed';
+      return result;
+    }
+
+    result.reviewed = true;
+    result.review = review;
+
+    // Add review comment if requested
+    if (options?.addReviewComment) {
+      const reviewBody = this.formatAIReviewAsComment(review);
+      const reviewEvent = review.approved ? 'APPROVE' : 
+        review.mergeRecommendation === 'request-changes' ? 'REQUEST_CHANGES' : 'COMMENT';
+      
+      await this.createPRReview(owner, repo, prNumber, {
+        body: reviewBody,
+        event: reviewEvent,
+      });
+    }
+
+    // Auto-merge if approved and enabled
+    if (
+      options?.mergeOnApproval &&
+      review.approved &&
+      review.mergeRecommendation === 'merge' &&
+      (!options?.requireApproval || this.config.autoMergeEnabled)
+    ) {
+      const mergeResult = await this.mergePullRequest(owner, repo, prNumber, {
+        commitTitle: `Merge PR #${prNumber}: ${prDetails.title}`,
+        commitMessage: `AI-approved merge\n\nReview summary: ${review.summary}`,
+        mergeMethod: 'squash',
+      });
+
+      result.merged = mergeResult.success;
+      if (!mergeResult.success) {
+        result.error = mergeResult.message;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Format AI review result as a comment
+   */
+  private formatAIReviewAsComment(review: PRReviewResult): string {
+    let comment = `## 🤖 AI Code Review\n\n`;
+    comment += `**Summary:** ${review.summary}\n\n`;
+    
+    if (review.approved) {
+      comment += `✅ **Approved** - Ready to merge\n\n`;
+    } else {
+      comment += `⚠️ **Changes Requested**\n\n`;
+    }
+
+    if (review.concerns.length > 0) {
+      comment += `### Concerns\n`;
+      for (const concern of review.concerns) {
+        comment += `- ${concern}\n`;
+      }
+      comment += '\n';
+    }
+
+    if (review.suggestions.length > 0) {
+      comment += `### Suggestions\n`;
+      for (const suggestion of review.suggestions) {
+        comment += `#### ${suggestion.file}\n`;
+        comment += `${suggestion.description}\n`;
+        if (suggestion.suggestedCode) {
+          comment += `\`\`\`\n${suggestion.suggestedCode}\n\`\`\`\n`;
+        }
+        comment += '\n';
+      }
+    }
+
+    comment += `\n---\n*Recommendation: **${review.mergeRecommendation}***\n`;
+    comment += `\n_This review was generated by XORNG AI (OpenRouter)_`;
+
+    return comment;
   }
 }

@@ -114,6 +114,9 @@ jobs:
             ACME_EMAIL=${{ secrets.ACME_EMAIL }}
             LOG_LEVEL=${{ secrets.LOG_LEVEL || 'info' }}
             AUTOMATION_IMAGE=${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}:latest
+            # AI Provider Configuration (OpenRouter - temporary solution)
+            OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+            OPENROUTER_MODEL=${{ secrets.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4' }}
             EOF
             
             # Login to GitHub Container Registry

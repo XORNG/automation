@@ -16,6 +16,7 @@ import { GitHubOrgService } from './github-org-service.js';
 import { IssueProcessor } from './issue-processor.js';
 import { FeedbackService } from './feedback-service.js';
 import { ServiceOrchestrator } from './service-orchestrator.js';
+import { AIService, createAIServiceFromEnv } from './ai-service.js';
 import { pino } from 'pino';
 
 const logger = pino({
@@ -38,6 +39,10 @@ interface ServerConfig {
   serviceDiscoveryEnabled: boolean;
   registryUrl: string;
   autoDeployServices: boolean;
+  // AI/LLM configuration (OpenRouter)
+  openRouterApiKey?: string;
+  openRouterModel?: string;
+  aiEnabled: boolean;
 }
 
 /**
@@ -56,6 +61,10 @@ function loadConfig(): ServerConfig {
     serviceDiscoveryEnabled: process.env.SERVICE_DISCOVERY_ENABLED === 'true',
     registryUrl: process.env.REGISTRY_URL || 'ghcr.io',
     autoDeployServices: process.env.AUTO_DEPLOY_SERVICES === 'true',
+    // AI/LLM configuration (OpenRouter - temporary solution)
+    openRouterApiKey: process.env.OPENROUTER_API_KEY,
+    openRouterModel: process.env.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4',
+    aiEnabled: !!process.env.OPENROUTER_API_KEY,
   };
 
   if (!config.githubToken) {
@@ -76,9 +85,17 @@ export class AutomationServer {
   private issueProcessor: IssueProcessor;
   private feedbackService: FeedbackService;
   private serviceOrchestrator?: ServiceOrchestrator;
+  private aiService: AIService;
 
   constructor(config: ServerConfig) {
     this.config = config;
+
+    // Initialize AI service (OpenRouter)
+    this.aiService = new AIService({
+      apiKey: config.openRouterApiKey || '',
+      model: config.openRouterModel || 'anthropic/claude-sonnet-4',
+      logLevel: config.logLevel,
+    });
 
     // Initialize services
     this.webhookServer = new WebhookServer({
@@ -100,6 +117,8 @@ export class AutomationServer {
       token: config.githubToken,
       organization: config.githubOrganization,
       logLevel: config.logLevel,
+      aiService: this.aiService,
+      autoMergeEnabled: config.aiEnabled, // Enable auto-merge when AI is configured
     });
 
     this.feedbackService = new FeedbackService({
@@ -254,7 +273,19 @@ export class AutomationServer {
       port: this.config.port,
       host: this.config.host,
       organization: this.config.githubOrganization,
+      aiEnabled: this.config.aiEnabled,
+      aiModel: this.config.openRouterModel,
     }, 'Starting XORNG Automation Server');
+
+    // Log AI service status
+    if (this.config.aiEnabled) {
+      logger.info({
+        model: this.config.openRouterModel,
+        provider: 'OpenRouter',
+      }, 'AI-powered processing enabled');
+    } else {
+      logger.warn('AI service disabled - OPENROUTER_API_KEY not configured');
+    }
 
     // Start webhook server
     await this.webhookServer.start();
@@ -354,7 +385,15 @@ export class AutomationServer {
       issueProcessor: this.issueProcessor,
       feedbackService: this.feedbackService,
       serviceOrchestrator: this.serviceOrchestrator,
+      aiService: this.aiService,
     };
+  }
+
+  /**
+   * Get AI service status
+   */
+  getAIStatus() {
+    return this.aiService.getStatus();
   }
 
   /**
