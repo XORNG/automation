@@ -91,7 +91,7 @@ jobs:
           username: ${{ secrets.VSERVER_USER }}
           key: ${{ secrets.VSERVER_SSH_KEY }}
           port: ${{ secrets.VSERVER_PORT || 22 }}
-          source: "docker-compose.yml"
+          source: "docker-compose.yml,traefik-dynamic.yml"
           target: "/opt/xorng"
 
       - name: Deploy via Docker Compose
